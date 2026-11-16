@@ -33,15 +33,38 @@ PHASE_VOLTAGE_V = 230
 # Total power the depot may draw from the grid (building + chargers together).
 SITE_LIMIT_KW = 150.0
 
-# The safety layer starts reducing charging power when the site reaches
-# this share of the limit, so there is room before the real limit is hit.
-SAFETY_MARGIN_FRACTION = 0.95
+# Margin kept free below the limit. The controller only sees the building
+# load once per meter reading (one simulated minute). If the building load
+# jumps right after a reading, the controller cannot react until the next
+# one. The margin must cover the biggest normal jump in that time, so the
+# site stays under the limit even before the controller has seen the jump.
+# In the synthetic building profile the biggest step is +15 kW (at 05:00
+# and 07:00), so the margin is 15 kW: charging is planned up to 135 kW
+# total site power. (5 % of the limit, 7.5 kW, would not cover that step.)
+# A bigger, abnormal jump (like the 40 kW load spike scenario) is not covered:
+# the safety layer then cuts charging at the next meter reading.
+SAFETY_MARGIN_KW = 15.0
 
 # ---------------------------------------------------------------------------
-# Planning
+# Planning and control
 # ---------------------------------------------------------------------------
 # Same length as one day-ahead price slot, so each plan step has one price.
 PLANNING_INTERVAL_MINUTES = 15
+
+# When a plan lowers some chargers and raises others, the controller waits for
+# the lowered chargers to report their new power before raising the others.
+# If they have not confirmed within this time, the increases are skipped
+# until the next plan (the safe choice).
+REDUCTION_CONFIRM_TIMEOUT_MINUTES = 2
+
+# Which charging strategy the controller uses: "uncontrolled" or "equal_sharing".
+# Change without editing this file:  set STRATEGY=uncontrolled
+STRATEGY = os.environ.get("STRATEGY", "equal_sharing")
+
+# Which test scenario the meter and the chargers play (see src/scenarios.py).
+# The controller only uses it to label its report, never to make decisions.
+# Change without editing this file:  set SCENARIO=load_spike
+SCENARIO = os.environ.get("SCENARIO", "normal_evening")
 
 # ---------------------------------------------------------------------------
 # Vans

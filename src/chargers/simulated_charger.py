@@ -105,9 +105,19 @@ class SimulatedCharger(ChargePoint):
         self.clock = clock
         self.max_power_kw = max_power_kw
 
-        # Until the controller sends a limit, the charger may use its full hardware power.
+        # The limit a new transaction starts with. Full hardware power until the
+        # controller sends a TxDefaultProfile (an uncontrolled depot never does).
+        self.default_limit_kw = max_power_kw
+        # The limit that applies right now, and whether it came from a TxProfile
+        # (a limit for this one transaction, which beats the default).
         self.power_limit_kw = max_power_kw
+        self.has_tx_profile = False
         self.charge_power_kw = 0.0
+
+        # Set when a new limit arrives, so the charging loop wakes up and applies it
+        # at once instead of at the end of its one minute step. A real charger
+        # follows a new limit within seconds.
+        self.new_limit_received = asyncio.Event()
         self.energy_meter_wh = 0.0
 
         # The van that is plugged in, and its battery level.
@@ -123,9 +133,13 @@ class SimulatedCharger(ChargePoint):
         self.last_energy_update_time = None
         self.last_meter_report_time = None
 
-        # One entry per charging step: (time, average power really drawn in that step [kW]).
-        # Used by the tests to check what power was really drawn.
+        # One entry per charging step, as a dict: start, end, power_kw (average power
+        # really drawn in the step) and state_of_charge_percent (at the end of the step).
+        # This is the "true" power, used by the tests to check the site limit.
         self.power_log = []
+
+        # One entry per van that has left: van_id and departure state of charge.
+        self.completed_visits = []
 
     # -----------------------------------------------------------------------
     # Messages the charger sends to the controller
@@ -244,6 +258,11 @@ class SimulatedCharger(ChargePoint):
         self.state_of_charge_percent = van.arrival_state_of_charge_percent
         self.transaction_id = str(uuid.uuid4())
         self.seq_no = 0
+
+        # A new transaction starts with the default limit (0 A in a controlled depot:
+        # the van waits until the controller gives it a share).
+        self.power_limit_kw = self.default_limit_kw
+        self.has_tx_profile = False
         self.events.info("%s van %s plugged in, state of charge %.1f %%",
                          self.clock.now().strftime("%H:%M"), van.van_id, self.state_of_charge_percent)
         await self.send_status(ConnectorStatusEnumType.occupied)
@@ -260,14 +279,14 @@ class SimulatedCharger(ChargePoint):
         """
         Charge the plugged-in van until its departure time.
 
-        Every simulated minute: count the energy of the minute that passed,
-        then set the power for the next minute from the newest controller limit.
+        Every simulated minute, or as soon as a new limit arrives: count the energy
+        since the last step, then set the power from the newest controller limit.
         """
         self.last_energy_update_time = self.clock.now()
         await self.apply_power_limit()
 
         while True:
-            await asyncio.sleep(self.clock.real_seconds(1))
+            await self.wait_for_next_step()
             # Never count energy past the departure time: the van has left by then.
             now = min(self.clock.now(), departure_time)
             self.update_energy(now)
@@ -285,11 +304,21 @@ class SimulatedCharger(ChargePoint):
                     ReadingContextEnumType.sample_periodic,
                 )
 
+    async def wait_for_next_step(self):
+        """Wait one simulated minute, or less if a new limit arrives first."""
+        self.new_limit_received.clear()
+        try:
+            await asyncio.wait_for(self.new_limit_received.wait(), timeout=self.clock.real_seconds(1))
+        except asyncio.TimeoutError:
+            # No new limit during the minute: a normal step.
+            pass
+
     def update_energy(self, now):
         """Add the energy delivered since the last update to the van and to the meter."""
         # A clock correction from a Heartbeat can move time back a tiny bit.
         # Never count negative time.
-        duration_hours = max(0.0, (now - self.last_energy_update_time).total_seconds() / 3600)
+        step_start = self.last_energy_update_time
+        duration_hours = max(0.0, (now - step_start).total_seconds() / 3600)
         self.state_of_charge_percent, grid_energy_kwh = charge_van(
             self.state_of_charge_percent, self.charge_power_kw, duration_hours)
         self.energy_meter_wh += grid_energy_kwh * 1000
@@ -300,7 +329,8 @@ class SimulatedCharger(ChargePoint):
         # from showing a power the charger never really drew.
         if duration_hours > 0:
             average_power_kw = min(self.charge_power_kw, grid_energy_kwh / duration_hours)
-            self.power_log.append((now, average_power_kw))
+            self.power_log.append({"start": step_start, "end": now, "power_kw": average_power_kw,
+                                   "state_of_charge_percent": self.state_of_charge_percent})
 
     async def apply_power_limit(self):
         """
@@ -342,13 +372,16 @@ class SimulatedCharger(ChargePoint):
             ReadingContextEnumType.transaction_end,
             stopped_reason=ReasonEnumType.ev_disconnected,
         )
+        self.completed_visits.append({"van_id": self.van.van_id,
+                                      "departure_state_of_charge_percent": self.state_of_charge_percent})
         self.transaction_id = None
         self.van = None
         self.state_of_charge_percent = None
         self.last_energy_update_time = None
 
-        # The controller's limit belonged to that transaction, so it no longer applies.
-        self.power_limit_kw = self.max_power_kw
+        # The controller's TxProfile belonged to that transaction, so it no longer applies.
+        self.power_limit_kw = self.default_limit_kw
+        self.has_tx_profile = False
         await self.send_status(ConnectorStatusEnumType.available)
 
     # -----------------------------------------------------------------------
@@ -360,31 +393,53 @@ class SimulatedCharger(ChargePoint):
         """
         Accept a new current limit from the controller.
 
+        Two kinds of profile are understood:
+        - TxDefaultProfile: the limit every new transaction starts with.
+        - TxProfile: a limit for the one running transaction; it beats the default.
+
         In: EVSE number and the OCPP charging profile (limit in amps per phase).
         Out: Accepted, or Rejected if the profile does not fit this charger.
         """
+        purpose = charging_profile["charging_profile_purpose"]
+        schedule = charging_profile["charging_schedule"][0]
+        if evse_id != EVSE_ID or schedule["charging_rate_unit"] != ChargingRateUnitEnumType.amps:
+            return call_result.SetChargingProfile(status=ChargingProfileStatusEnumType.rejected)
+
+        # Our controller always sends one period that starts at once, so this simple
+        # charger only reads the first period and ignores the schedule start time.
+        limit_kw = self.limit_from_amps(schedule["charging_schedule_period"][0]["limit"])
+
+        if purpose == ChargingProfilePurposeEnumType.tx_default_profile:
+            self.default_limit_kw = limit_kw
+            # A running transaction without its own TxProfile follows the new default too.
+            if self.transaction_id is not None and not self.has_tx_profile:
+                self.power_limit_kw = limit_kw
+                self.new_limit_received.set()
+            return call_result.SetChargingProfile(status=ChargingProfileStatusEnumType.accepted)
+
         # A TxProfile is a limit for one running transaction only. If there is
         # no transaction, or it is for another one, the charger must refuse it.
         is_for_this_transaction = (
-            evse_id == EVSE_ID
+            purpose == ChargingProfilePurposeEnumType.tx_profile
             and self.transaction_id is not None
             and charging_profile.get("transaction_id") == self.transaction_id
-            and charging_profile["charging_profile_purpose"] == ChargingProfilePurposeEnumType.tx_profile
         )
-        schedule = charging_profile["charging_schedule"][0]
-        if not is_for_this_transaction or schedule["charging_rate_unit"] != ChargingRateUnitEnumType.amps:
+        if not is_for_this_transaction:
             return call_result.SetChargingProfile(status=ChargingProfileStatusEnumType.rejected)
 
-        # Our controller always sends one period that starts now, so this simple
-        # charger only reads the first period and ignores the schedule start time.
-        limit_a = schedule["charging_schedule_period"][0]["limit"]
+        self.power_limit_kw = limit_kw
+        self.has_tx_profile = True
+        # Wake the charging loop so the new limit applies at once.
+        self.new_limit_received.set()
+        return call_result.SetChargingProfile(status=ChargingProfileStatusEnumType.accepted)
 
+    def limit_from_amps(self, limit_a):
+        """In: current limit per phase [A]. Out: power limit [kW], following the 6 A rule."""
         # Like a real AC charger: it cannot offer the car less than 6 A,
         # so a limit between 0 and 6 A means "pause".
         if limit_a < settings.CHARGER_MIN_CURRENT_A:
             limit_a = 0.0
-        self.power_limit_kw = current_a_to_power_kw(limit_a)
-        return call_result.SetChargingProfile(status=ChargingProfileStatusEnumType.accepted)
+        return current_a_to_power_kw(limit_a)
 
 
 async def run_charger(charger_id, van, host, port, simulation_speed=settings.SIMULATED_SECONDS_PER_REAL_SECOND):

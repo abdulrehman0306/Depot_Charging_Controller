@@ -8,7 +8,7 @@ from datetime import timedelta
 import pytest
 
 import settings
-from src.controller.central_system import read_building_load_kw
+from src.controller.site_control import read_building_load_kw
 from src.controller.meter_reader import create_meter_client, read_meter, write_meter_clock
 from src.meter.registers import (
     build_meter_registers,

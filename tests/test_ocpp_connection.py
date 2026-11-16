@@ -16,22 +16,16 @@ from websockets.asyncio.client import connect
 import settings
 from src.chargers.simulated_charger import SimulatedCharger, run_charger
 from src.chargers.van import Van
-from src.controller.central_system import build_charging_profile, planning_loop, read_meter_values
+from src.controller.central_system import (
+    build_charging_profile,
+    build_default_profile,
+    read_meter_values,
+    send_power_limit,
+)
 from src.sim_clock import SimulationClock
 from tests.conftest import TEST_SIMULATION_SPEED
 
 START = settings.SIMULATION_START_TIME
-
-
-def make_fixed_limit_strategy(limit_kw):
-    """Out: a test strategy that gives every charging van the same fixed limit [kW]."""
-    def fixed_limit(connected_chargers):
-        limits_kw = {}
-        for charger_id, charger in connected_chargers.items():
-            if charger.transaction_id is not None:
-                limits_kw[charger_id] = limit_kw
-        return limits_kw
-    return fixed_limit
 
 
 def make_test_van(clock):
@@ -167,16 +161,32 @@ async def test_controller_follows_the_transaction_from_start_to_end(csms):
         listener_task.cancel()
 
 
+async def run_charger_with_one_limit(csms, limit_kw):
+    """
+    Run one charger with a two hour van visit. Once the van has charged for ten
+    simulated minutes at full power, the controller sends it one limit.
+
+    In: the csms fixture dict, the limit to send [kW].
+    Out: (SimulatedCharger after the visit, the controller's ChargerConnection for it).
+    """
+    charger_task = asyncio.create_task(run_charger("CP01", make_test_van(csms["clock"]), "127.0.0.1",
+                                                   csms["port"], TEST_SIMULATION_SPEED))
+    # Wait until the controller sees the van charging, then ten more simulated minutes.
+    while "CP01" not in csms["chargers"] or csms["chargers"]["CP01"].transaction_id is None:
+        await asyncio.sleep(0.001)
+    controller_view = csms["chargers"]["CP01"]
+    await asyncio.sleep(csms["clock"].real_seconds(10))
+
+    await send_power_limit(controller_view, limit_kw)
+    charger = await charger_task
+    return charger, controller_view
+
+
 async def test_charger_slows_down_to_the_limit_from_the_controller(csms):
-    strategy = make_fixed_limit_strategy(11.0)
-    planning_task = asyncio.create_task(planning_loop(csms["chargers"], strategy, csms["clock"]))
+    charger, _ = await run_charger_with_one_limit(csms, 11.0)
 
-    charger = await run_charger("CP01", make_test_van(csms["clock"]), "127.0.0.1", csms["port"],
-                                TEST_SIMULATION_SPEED)
-    planning_task.cancel()
-
-    powers_kw = [power_kw for _, power_kw in charger.power_log]
-    # Full power before the first plan arrives.
+    powers_kw = [step["power_kw"] for step in charger.power_log]
+    # Full power before the limit arrives (this test server sends no default limit).
     assert powers_kw[0] == pytest.approx(22.0)
     # After it: 15.9 A x 3 x 230 V = 10.97 kW. Slightly under 11 kW because amps are rounded down.
     assert powers_kw[-1] == pytest.approx(10.971)
@@ -185,33 +195,30 @@ async def test_charger_slows_down_to_the_limit_from_the_controller(csms):
 
 async def test_plan_below_6_amps_is_sent_as_pause(csms):
     # 3 kW would be 4.3 A, which a charger cannot offer. The controller must send 0 A instead.
-    strategy = make_fixed_limit_strategy(3.0)
-    planning_task = asyncio.create_task(planning_loop(csms["chargers"], strategy, csms["clock"]))
+    charger, controller_view = await run_charger_with_one_limit(csms, 3.0)
 
-    # Keep a reference to the controller's view while the charger is connected,
-    # because the controller forgets a charger when it disconnects.
-    charger_task = asyncio.create_task(run_charger("CP01", make_test_van(csms["clock"]), "127.0.0.1",
-                                                   csms["port"], TEST_SIMULATION_SPEED))
-    while "CP01" not in csms["chargers"]:
-        await asyncio.sleep(0.001)
-    controller_view = csms["chargers"]["CP01"]
-    charger = await charger_task
-    planning_task.cancel()
-    sent_limits_a = [limit_a for _, limit_a in controller_view.sent_limits_a]
-
-    assert len(sent_limits_a) > 0
-    assert all(limit_a == 0.0 for limit_a in sent_limits_a)
+    assert [limit_a for _, limit_a in controller_view.sent_limits_a] == [0.0]
     # Once paused, the van draws nothing.
-    assert charger.power_log[-1][1] == 0.0
+    assert charger.power_log[-1]["power_kw"] == 0.0
 
 
 async def test_charger_never_goes_above_its_hardware_limit(csms):
     # The controller asks for more than the charger can give.
-    strategy = make_fixed_limit_strategy(50.0)
-    planning_task = asyncio.create_task(planning_loop(csms["chargers"], strategy, csms["clock"]))
+    charger, _ = await run_charger_with_one_limit(csms, 50.0)
+    assert max(step["power_kw"] for step in charger.power_log) <= settings.CHARGER_MAX_POWER_KW
 
-    charger = await run_charger("CP01", make_test_van(csms["clock"]), "127.0.0.1", csms["port"],
-                                TEST_SIMULATION_SPEED)
-    planning_task.cancel()
 
-    assert max(power_kw for _, power_kw in charger.power_log) <= settings.CHARGER_MAX_POWER_KW
+async def test_default_profile_makes_a_new_van_wait(csms):
+    address = f"ws://127.0.0.1:{csms['port']}/CP01"
+    async with connect(address, subprotocols=[settings.OCPP_SUBPROTOCOL]) as websocket:
+        charger = SimulatedCharger("CP01", websocket, SimulationClock(START, TEST_SIMULATION_SPEED))
+        listener_task = asyncio.create_task(charger.start())
+        await charger.boot()
+
+        # The controller tells the charger: new transactions start at 0 A.
+        controller_view = csms["chargers"]["CP01"]
+        await controller_view.call(call.SetChargingProfile(evse_id=1, charging_profile=build_default_profile(0.0)))
+        await charger.plug_in_van(make_test_van(charger.clock))
+
+        assert charger.power_limit_kw == 0.0
+        listener_task.cancel()

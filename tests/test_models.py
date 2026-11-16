@@ -9,10 +9,17 @@ from datetime import timedelta
 import pytest
 
 import settings
-from src.chargers.van import charge_van, grid_energy_to_reach_kwh
+from src.chargers.van import Van, charge_van, grid_energy_to_reach_kwh
 from src.electrical import charging_current_limit_a, current_a_to_power_kw, power_kw_to_current_a
-from src.meter.building_load import building_load_kw
-from src.results import minutes_over_limit, peak_site_power
+from src.meter.building_load import LoadSpike, building_load_kw
+from src.results import (
+    charger_power_at,
+    minutes_over_limit,
+    over_limit_episodes,
+    peak_site_power,
+    spike_reaction_minutes,
+    van_results,
+)
 from src.scenarios import clock_time_on_day, generate_normal_evening
 
 START = settings.SIMULATION_START_TIME
@@ -129,3 +136,36 @@ def test_peak_site_power_and_its_time():
 def test_minutes_over_limit_counts_each_minute_over():
     # Minutes 1 and 2 are over 150 kW. The last sample has no "next" sample, so it adds no time.
     assert minutes_over_limit(make_site_log([100, 160, 155, 120, 170]), 150) == 2.0
+
+
+def test_over_limit_episodes_have_start_and_end():
+    episodes = over_limit_episodes(make_site_log([100, 160, 155, 120, 170]), 150)
+    # Over from minute 1 to minute 3, and again from minute 4 until the log ends.
+    assert episodes == [(START + timedelta(minutes=1), START + timedelta(minutes=3)),
+                        (START + timedelta(minutes=4), None)]
+
+
+def test_spike_reaction_is_measured_from_the_spike_start():
+    # Spike starts at minute 2. The log shows it over the limit at minutes 3 and 4, back under at 5.
+    spike = LoadSpike(START + timedelta(minutes=2), 20, 40.0)
+    site_log = make_site_log([130, 130, 130, 175, 160, 140, 140])
+    assert spike_reaction_minutes(site_log, spike, 150) == 3.0
+
+
+def test_spike_reaction_is_zero_when_the_margin_was_enough():
+    spike = LoadSpike(START + timedelta(minutes=1), 2, 10.0)
+    assert spike_reaction_minutes(make_site_log([130, 140, 140, 130, 130]), spike, 150) == 0.0
+
+
+def test_van_shortfall_is_the_missing_battery_energy():
+    van = Van("V01", START, START + timedelta(hours=5), 5.0)
+    # Left with 70 %: 20 % of 75 kWh = 15 kWh missing to reach 90 %.
+    results = van_results([van], [{"van_id": "V01", "departure_state_of_charge_percent": 70.0}])
+    assert results[0]["reached_target"] is False
+    assert results[0]["shortfall_kwh"] == pytest.approx(15.0)
+
+
+def test_true_site_power_uses_what_the_charger_really_drew():
+    power_log = [{"start": START, "end": START + timedelta(minutes=10), "power_kw": 11.0}]
+    assert charger_power_at(power_log, START + timedelta(minutes=5)) == 11.0
+    assert charger_power_at(power_log, START + timedelta(minutes=10)) == 0.0

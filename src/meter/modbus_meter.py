@@ -25,6 +25,7 @@ from pymodbus.simulator import DataType, SimData, SimDevice
 import settings
 from src.log_setup import setup_logging
 from src.meter.building_load import building_load_kw
+from src.scenarios import get_scenario
 from src.meter.registers import (
     CLOCK_SYNC_UNIX_S,
     HOLDING_REGISTERS,
@@ -62,9 +63,11 @@ class SimulatedMeter:
     A class is used because the meter has to remember its energy counter and clock between updates.
     """
 
-    def __init__(self, server, clock):
+    def __init__(self, server, clock, load_spikes=()):
         self.server = server
         self.clock = clock
+        # Extra loads of the scenario (synthetic), e.g. the 40 kW workshop spike.
+        self.load_spikes = load_spikes
         self.building_power_kw = 0.0
         self.energy_import_kwh = 0.0
         self.last_update_time = None
@@ -92,9 +95,9 @@ class SimulatedMeter:
             self.energy_import_kwh += self.building_power_kw * duration_hours
         self.last_update_time = now
 
-        new_power_kw = building_load_kw(now)
+        new_power_kw = building_load_kw(now, self.load_spikes)
         if new_power_kw != self.building_power_kw:
-            self.events.info("%s building load %.1f kW", now.strftime("%H:%M"), new_power_kw)
+            self.events.info("%s building load %.1f kW", now.strftime("%H:%M:%S"), new_power_kw)
         self.building_power_kw = new_power_kw
 
         registers = build_meter_registers(self.building_power_kw, self.energy_import_kwh,
@@ -112,9 +115,10 @@ async def run_meter():
     """Start the meter server and keep its registers up to date. Runs forever."""
     clock = SimulationClock(settings.SIMULATION_START_TIME, settings.SIMULATED_SECONDS_PER_REAL_SECOND)
     server, port = await start_meter_server(settings.METER_HOST, settings.METER_PORT)
-    logging.getLogger("METER").info("Modbus TCP meter listening on %s:%s, unit id %s",
-                                    settings.METER_HOST, port, settings.METER_DEVICE_ID)
-    await SimulatedMeter(server, clock).run()
+    scenario = get_scenario(settings.SCENARIO)
+    logging.getLogger("METER").info("Modbus TCP meter listening on %s:%s, unit id %s, scenario %s",
+                                    settings.METER_HOST, port, settings.METER_DEVICE_ID, scenario["name"])
+    await SimulatedMeter(server, clock, scenario["load_spikes"]).run()
 
 
 def main():
