@@ -16,5 +16,6 @@ def setup_logging():
     else:
         logging.getLogger("ocpp").setLevel(logging.WARNING)
 
-    # The WebSocket library's own messages are not interesting for us.
+    # The WebSocket and Modbus libraries' own messages are not interesting for us.
     logging.getLogger("websockets").setLevel(logging.WARNING)
+    logging.getLogger("pymodbus").setLevel(logging.WARNING)

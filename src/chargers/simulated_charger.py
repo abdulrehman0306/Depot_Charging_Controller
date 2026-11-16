@@ -378,6 +378,11 @@ class SimulatedCharger(ChargePoint):
         # Our controller always sends one period that starts now, so this simple
         # charger only reads the first period and ignores the schedule start time.
         limit_a = schedule["charging_schedule_period"][0]["limit"]
+
+        # Like a real AC charger: it cannot offer the car less than 6 A,
+        # so a limit between 0 and 6 A means "pause".
+        if limit_a < settings.CHARGER_MIN_CURRENT_A:
+            limit_a = 0.0
         self.power_limit_kw = current_a_to_power_kw(limit_a)
         return call_result.SetChargingProfile(status=ChargingProfileStatusEnumType.accepted)
 

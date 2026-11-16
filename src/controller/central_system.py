@@ -7,10 +7,12 @@ track of what each charger is doing. Three jobs run side by side:
 1. One connection handler per charger, answering its OCPP messages.
 2. The planning loop: every 15 simulated minutes, ask the charging strategy
    for each charger's power limit and send it with SetChargingProfile.
-3. The site monitor: every simulated minute, add up building load and
-   charging power and compare it with the grid connection limit.
+3. The site monitor: every simulated minute, read the building load from the
+   energy meter over Modbus TCP, add the charging power, and compare the
+   total with the grid connection limit.
 
-The controller owns the simulated clock. Chargers set their clocks from it.
+The controller owns the simulated clock. Chargers set their clocks from it
+over OCPP, and the meter through its clock registers.
 
 Run it:
     python -m src.controller.central_system
@@ -36,9 +38,9 @@ from websockets.exceptions import ConnectionClosed
 
 import settings
 from src.controller import strategies
-from src.electrical import power_kw_to_current_a
+from src.electrical import charging_current_limit_a
+from src.controller.meter_reader import MeterReadError, create_meter_client, read_meter, write_meter_clock
 from src.log_setup import setup_logging
-from src.meter.building_load import building_load_kw
 from src.results import minutes_over_limit, peak_site_power
 from src.sim_clock import SimulationClock
 
@@ -86,6 +88,7 @@ def build_charging_profile(transaction_id, limit_kw, start_time_iso):
     # Absolute:   the schedule starts at a fixed clock time (start_schedule).
     # One period starting at 0 s: "from now on, at most limit_a on each of 3 phases".
     # The plan is in kW; real AC chargers are controlled in amps, so we convert here, at the edge.
+    # The limit is always 0 A (pause) or at least 6 A, see charging_current_limit_a.
     return {
         "id": CHARGING_PROFILE_ID,
         "stack_level": 0,
@@ -99,7 +102,7 @@ def build_charging_profile(transaction_id, limit_kw, start_time_iso):
                 "charging_rate_unit": ChargingRateUnitEnumType.amps,
                 "charging_schedule_period": [{
                     "start_period": 0,
-                    "limit": power_kw_to_current_a(limit_kw),
+                    "limit": charging_current_limit_a(limit_kw),
                     "number_phases": settings.CHARGER_NUMBER_OF_PHASES,
                 }],
             }
@@ -125,6 +128,10 @@ class ChargerConnection(ChargePoint):
         self.energy_meter_wh = 0.0
         self.state_of_charge_percent = None
         self.last_heartbeat_time = None
+
+        # Every current limit sent to this charger: (simulated time, limit [A]).
+        # Lets the tests check that no limit between 0 and 6 A was ever sent.
+        self.sent_limits_a = []
 
     @on(Action.boot_notification)
     def on_boot_notification(self, charging_station, reason, **kwargs):
@@ -196,8 +203,12 @@ async def send_power_limit(charger, limit_kw):
     In: ChargerConnection, power limit [kW].
     Out: the charger's answer, "Accepted" or "Rejected".
     """
-    profile = build_charging_profile(charger.transaction_id, limit_kw, charger.clock.now().isoformat())
+    now = charger.clock.now()
+    profile = build_charging_profile(charger.transaction_id, limit_kw, now.isoformat())
     response = await charger.call(call.SetChargingProfile(evse_id=1, charging_profile=profile))
+
+    limit_a = profile["charging_schedule"][0]["charging_schedule_period"][0]["limit"]
+    charger.sent_limits_a.append((now, limit_a))
     return response.status
 
 
@@ -223,16 +234,13 @@ async def planning_loop(connected_chargers, strategy, clock):
 # Site monitor: total power against the grid limit
 # ---------------------------------------------------------------------------
 
-def take_site_sample(connected_chargers, sim_time):
+def take_site_sample(connected_chargers, sim_time, building_kw):
     """
     Add up the site's power right now.
 
-    In: dict of connected chargers, simulated time.
+    In: dict of connected chargers, simulated time, building load from the meter [kW].
     Out: one site log sample (dict with time, building_kw, charging_kw, site_kw).
     """
-    # Stage 2: the building load comes straight from the synthetic profile.
-    # From Stage 3 on it is read from the energy meter over Modbus.
-    building_kw = building_load_kw(sim_time)
     charging_kw = sum(charger.charge_power_kw for charger in connected_chargers.values())
     return {
         "time": sim_time,
@@ -252,14 +260,36 @@ def log_site_sample(sample, number_charging):
     site_events.info(line)
 
 
-async def site_monitor_loop(connected_chargers, clock, site_log):
+async def read_building_load_kw(meter_client, sim_time, last_building_kw):
     """
-    Every simulated minute, add a site sample to site_log.
+    Sync the meter's clock, then read the building load from it.
+
+    In: Modbus client, simulated time, the last good reading [kW] or None.
+    Out: building load [kW]. If the meter cannot be read: the last good reading,
+         or a safe high guess if there never was one.
+    """
+    try:
+        await write_meter_clock(meter_client, sim_time)
+        return (await read_meter(meter_client))["power_kw"]
+    except MeterReadError as error:
+        site_events.warning("meter not readable (%s), using %s", error,
+                            "last reading" if last_building_kw is not None else "safe guess")
+        if last_building_kw is not None:
+            return last_building_kw
+        return settings.BUILDING_LOAD_IF_METER_UNKNOWN_KW
+
+
+async def site_monitor_loop(connected_chargers, clock, site_log, meter_client):
+    """
+    Every simulated minute, read the building meter and add a site sample to site_log.
     Print a line once per quarter hour so the output stays readable. Runs forever.
     """
     last_printed_quarter = None
+    building_kw = None
     while True:
-        sample = take_site_sample(connected_chargers, clock.now())
+        now = clock.now()
+        building_kw = await read_building_load_kw(meter_client, now, building_kw)
+        sample = take_site_sample(connected_chargers, now, building_kw)
         site_log.append(sample)
 
         quarter = (sample["time"].hour, sample["time"].minute // 15)
@@ -333,15 +363,18 @@ async def run_csms(strategy):
     connected_chargers = {}
     site_log = []
 
+    meter_client = create_meter_client(settings.METER_HOST, settings.METER_PORT)
+
     await start_csms_server(settings.CSMS_HOST, settings.CSMS_PORT, connected_chargers, clock, site_log)
     site_events.info("listening on ws://%s:%s, strategy: %s, simulation speed: %sx",
                      settings.CSMS_HOST, settings.CSMS_PORT, strategy.__name__,
                      settings.SIMULATED_SECONDS_PER_REAL_SECOND)
+    site_events.info("reading building meter at %s:%s over Modbus TCP", settings.METER_HOST, settings.METER_PORT)
 
     # Run planning and monitoring side by side, forever.
     await asyncio.gather(
         planning_loop(connected_chargers, strategy, clock),
-        site_monitor_loop(connected_chargers, clock, site_log),
+        site_monitor_loop(connected_chargers, clock, site_log, meter_client),
     )
 
 

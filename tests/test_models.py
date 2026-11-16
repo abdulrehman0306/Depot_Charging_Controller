@@ -10,7 +10,7 @@ import pytest
 
 import settings
 from src.chargers.van import charge_van, grid_energy_to_reach_kwh
-from src.electrical import current_a_to_power_kw, power_kw_to_current_a
+from src.electrical import charging_current_limit_a, current_a_to_power_kw, power_kw_to_current_a
 from src.meter.building_load import building_load_kw
 from src.results import minutes_over_limit, peak_site_power
 from src.scenarios import clock_time_on_day, generate_normal_evening
@@ -37,6 +37,21 @@ def test_kw_to_amps_rounds_down():
 def test_rounding_never_allows_more_power_than_asked():
     for power_kw in [0.5, 4.2, 7.0, 11.0, 13.33, 15.0, 22.0]:
         assert current_a_to_power_kw(power_kw_to_current_a(power_kw)) <= power_kw
+
+
+def test_current_limit_is_never_between_0_and_6_amps():
+    for power_kw in [0.0, 0.5, 2.0, 4.0, 4.13, 4.14, 4.2, 7.0, 11.0, 22.0, 30.0]:
+        limit_a = charging_current_limit_a(power_kw)
+        assert limit_a == 0.0 or settings.CHARGER_MIN_CURRENT_A <= limit_a <= settings.CHARGER_MAX_CURRENT_A
+
+
+def test_current_limit_pauses_below_6_amps_and_caps_at_32_amps():
+    # 4.0 kW = 5.8 A: below the minimum, so the van pauses.
+    assert charging_current_limit_a(4.0) == 0.0
+    # 4.14 kW = exactly 6.0 A: allowed.
+    assert charging_current_limit_a(4.14) == 6.0
+    # 30 kW would be 43.4 A: capped at the charger's 32 A.
+    assert charging_current_limit_a(30.0) == 32.0
 
 
 # ---------------------------------------------------------------------------

@@ -5,8 +5,8 @@ This profile is SYNTHETIC: made-up values for a small delivery depot in
 winter, not a measurement. Base load at night, higher in the morning when
 vans are loaded, highest while the workshop works.
 
-In Stage 2 the controller reads this function directly. From Stage 3 on it
-is served by a simulated energy meter over Modbus TCP, like a real meter.
+Only the simulated meter (modbus_meter.py) uses this function. The controller
+never calls it: it reads the meter over Modbus TCP, like it would read a real one.
 """
 
 # Building power [kW] for each hour of the day. Index 0 = 00:00-01:00.

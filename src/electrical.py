@@ -32,6 +32,24 @@ def power_kw_to_current_a(power_kw, number_of_phases=settings.CHARGER_NUMBER_OF_
     return math.floor(exact_current_a * 10 + 1e-9) / 10
 
 
+def charging_current_limit_a(power_kw):
+    """
+    The current limit to send to a charger for a planned power, following the charging standard.
+
+    In: planned power for one van [kW].
+    Out: current per phase [A]: either 0 (van paused) or between the 6 A minimum and the 32 A maximum.
+    """
+    current_a = power_kw_to_current_a(power_kw)
+
+    # IEC 61851-1: the charger cannot signal less than 6 A to the car. A plan
+    # below 6 A cannot be carried out, so the van pauses (0 A). Rounding down
+    # to 0 instead of up to 6 A keeps the site under its limit. The strategies
+    # are responsible for planning 0 or at least 6 A, so this rarely triggers.
+    if current_a < settings.CHARGER_MIN_CURRENT_A:
+        return 0.0
+    return min(current_a, settings.CHARGER_MAX_CURRENT_A)
+
+
 def current_a_to_power_kw(current_a, number_of_phases=settings.CHARGER_NUMBER_OF_PHASES,
                           phase_voltage_v=settings.PHASE_VOLTAGE_V):
     """

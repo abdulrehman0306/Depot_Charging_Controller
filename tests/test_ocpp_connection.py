@@ -95,6 +95,19 @@ def test_charger_turns_the_amps_limit_back_into_kw():
     assert charger.power_limit_kw == pytest.approx(11.04)
 
 
+def test_charger_treats_a_limit_below_6_amps_as_pause():
+    charger = SimulatedCharger("CP01", None, SimulationClock(START, 60))
+    charger.transaction_id = "tx-1"
+    # Built by hand, because our controller would never send 4 A.
+    profile = build_charging_profile("tx-1", 11.0, START.isoformat())
+    profile["charging_schedule"][0]["charging_schedule_period"][0]["limit"] = 4.0
+
+    response = charger.on_set_charging_profile(evse_id=1, charging_profile=profile)
+
+    assert response.status == "Accepted"
+    assert charger.power_limit_kw == 0.0
+
+
 # ---------------------------------------------------------------------------
 # Full OCPP conversation over a real WebSocket
 # ---------------------------------------------------------------------------
@@ -168,6 +181,28 @@ async def test_charger_slows_down_to_the_limit_from_the_controller(csms):
     # After it: 15.9 A x 3 x 230 V = 10.97 kW. Slightly under 11 kW because amps are rounded down.
     assert powers_kw[-1] == pytest.approx(10.971)
     assert powers_kw[-1] <= 11.0
+
+
+async def test_plan_below_6_amps_is_sent_as_pause(csms):
+    # 3 kW would be 4.3 A, which a charger cannot offer. The controller must send 0 A instead.
+    strategy = make_fixed_limit_strategy(3.0)
+    planning_task = asyncio.create_task(planning_loop(csms["chargers"], strategy, csms["clock"]))
+
+    # Keep a reference to the controller's view while the charger is connected,
+    # because the controller forgets a charger when it disconnects.
+    charger_task = asyncio.create_task(run_charger("CP01", make_test_van(csms["clock"]), "127.0.0.1",
+                                                   csms["port"], TEST_SIMULATION_SPEED))
+    while "CP01" not in csms["chargers"]:
+        await asyncio.sleep(0.001)
+    controller_view = csms["chargers"]["CP01"]
+    charger = await charger_task
+    planning_task.cancel()
+    sent_limits_a = [limit_a for _, limit_a in controller_view.sent_limits_a]
+
+    assert len(sent_limits_a) > 0
+    assert all(limit_a == 0.0 for limit_a in sent_limits_a)
+    # Once paused, the van draws nothing.
+    assert charger.power_log[-1][1] == 0.0
 
 
 async def test_charger_never_goes_above_its_hardware_limit(csms):

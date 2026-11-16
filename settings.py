@@ -20,6 +20,10 @@ CHARGER_MAX_POWER_KW = 22.0
 CHARGER_MAX_CURRENT_A = 32
 CHARGER_NUMBER_OF_PHASES = 3
 
+# IEC 61851-1: an AC charger cannot offer a car less than 6 A per phase.
+# A van gets either 0 A (paused) or at least 6 A (about 4.1 kW on three phases).
+CHARGER_MIN_CURRENT_A = 6
+
 # Phase-to-neutral voltage of the German low voltage grid (400 V between phases).
 PHASE_VOLTAGE_V = 230
 
@@ -96,6 +100,21 @@ OCPP_SUBPROTOCOL = "ocpp2.0.1"
 # How often a charger says "I am still alive", in real seconds.
 # Real chargers often use 300 s or more; it is short here so you see it in a demo.
 HEARTBEAT_INTERVAL_S = 10
+
+# ---------------------------------------------------------------------------
+# Building energy meter (Modbus TCP)
+# ---------------------------------------------------------------------------
+METER_HOST = "localhost"
+# The standard Modbus TCP port is 502, but ports below 1024 need admin rights
+# on Linux, so the simulated meter uses 5020.
+METER_PORT = 5020
+# Modbus "unit id" (also called slave id or device id) of the meter.
+METER_DEVICE_ID = 1
+
+# If the meter cannot be read and there is no earlier reading, assume the
+# building draws this much. A high guess is the safe side: it leaves less
+# room for charging, never more.
+BUILDING_LOAD_IF_METER_UNKNOWN_KW = 60.0
 
 # How often a charging charger reports its meter, in simulated minutes.
 METER_VALUE_INTERVAL_MINUTES = 5
