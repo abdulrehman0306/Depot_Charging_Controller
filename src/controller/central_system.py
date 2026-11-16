@@ -1,12 +1,16 @@
 """
 The central controller: an OCPP 2.0.1 CSMS (charging station management system).
 
-Chargers connect to it over WebSockets. It answers their messages, keeps track
-of what each charger is doing, and on a fixed cycle sends each charging van a
-power limit with SetChargingProfile.
+Chargers connect to it over WebSockets. It answers their messages and keeps
+track of what each charger is doing. Three jobs run side by side:
 
-Stage 1: the limit is a fixed demo value, to show that the charger obeys it.
-The real strategies (equal sharing, smart planning) come in later stages.
+1. One connection handler per charger, answering its OCPP messages.
+2. The planning loop: every 15 simulated minutes, ask the charging strategy
+   for each charger's power limit and send it with SetChargingProfile.
+3. The site monitor: every simulated minute, add up building load and
+   charging power and compare it with the grid connection limit.
+
+The controller owns the simulated clock. Chargers set their clocks from it.
 
 Run it:
     python -m src.controller.central_system
@@ -31,30 +35,29 @@ from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed
 
 import settings
-
-# Stage 1 only: a fixed limit, half of the charger's 22 kW, so you can see
-# the charger slow down when the controller tells it to.
-DEMO_POWER_LIMIT_KW = 11.0
+from src.controller import strategies
+from src.electrical import power_kw_to_current_a
+from src.log_setup import setup_logging
+from src.meter.building_load import building_load_kw
+from src.results import minutes_over_limit, peak_site_power
+from src.sim_clock import SimulationClock
 
 # The controller keeps one profile per charger and replaces it every cycle.
 # Sending a profile with the same id replaces the old one on the charger.
 CHARGING_PROFILE_ID = 1
 
-
-def utc_now_iso():
-    """Out: the current real time in UTC as an ISO 8601 text, the format OCPP uses."""
-    return datetime.now(timezone.utc).isoformat()
+site_events = logging.getLogger("CSMS")
 
 
-def read_power_and_energy(meter_values):
+def read_meter_values(meter_values):
     """
-    Pull the charging power and the energy counter out of OCPP meter readings.
+    Pull charging power, energy counter and state of charge out of OCPP meter readings.
 
     In: list of MeterValueType dicts, as received in MeterValues or TransactionEvent.
-    Out: (power [kW], energy meter [Wh]). A value is None if it was not in the readings.
+    Out: dict with "power_kw", "energy_wh" and "state_of_charge_percent".
+         A value is None if it was not in the readings.
     """
-    power_kw = None
-    energy_wh = None
+    values = {"power_kw": None, "energy_wh": None, "state_of_charge_percent": None}
 
     # A message can carry several readings; the last one is the newest.
     for reading in meter_values:
@@ -64,10 +67,12 @@ def read_power_and_energy(meter_values):
 
             # Chargers may send W or kW (and Wh or kWh). Convert to the units we work in.
             if measurand == MeasurandEnumType.power_active_import:
-                power_kw = sample["value"] / 1000 if unit == "W" else sample["value"]
+                values["power_kw"] = sample["value"] / 1000 if unit == "W" else sample["value"]
             elif measurand == MeasurandEnumType.energy_active_import_register:
-                energy_wh = sample["value"] * 1000 if unit == "kWh" else sample["value"]
-    return power_kw, energy_wh
+                values["energy_wh"] = sample["value"] * 1000 if unit == "kWh" else sample["value"]
+            elif measurand == MeasurandEnumType.soc:
+                values["state_of_charge_percent"] = sample["value"]
+    return values
 
 
 def build_charging_profile(transaction_id, limit_kw, start_time_iso):
@@ -75,12 +80,12 @@ def build_charging_profile(transaction_id, limit_kw, start_time_iso):
     Build an OCPP 2.0.1 charging profile that caps the power of one transaction.
 
     In: transaction id, power limit [kW], schedule start time (ISO text).
-    Out: a ChargingProfileType as a dict.
+    Out: a ChargingProfileType as a dict, with the limit in amps per phase.
     """
     # TxProfile:  the limit belongs to this one charging session only.
     # Absolute:   the schedule starts at a fixed clock time (start_schedule).
-    # One period starting at 0 s: "from now on, at most limit_w".
-    # We use watts, not amps, because the whole project reasons in kW.
+    # One period starting at 0 s: "from now on, at most limit_a on each of 3 phases".
+    # The plan is in kW; real AC chargers are controlled in amps, so we convert here, at the edge.
     return {
         "id": CHARGING_PROFILE_ID,
         "stack_level": 0,
@@ -91,8 +96,12 @@ def build_charging_profile(transaction_id, limit_kw, start_time_iso):
             {
                 "id": 1,
                 "start_schedule": start_time_iso,
-                "charging_rate_unit": ChargingRateUnitEnumType.watts,
-                "charging_schedule_period": [{"start_period": 0, "limit": limit_kw * 1000}],
+                "charging_rate_unit": ChargingRateUnitEnumType.amps,
+                "charging_schedule_period": [{
+                    "start_period": 0,
+                    "limit": power_kw_to_current_a(limit_kw),
+                    "number_phases": settings.CHARGER_NUMBER_OF_PHASES,
+                }],
             }
         ],
     }
@@ -107,24 +116,24 @@ class ChargerConnection(ChargePoint):
     Here it plays the controller role: the @on methods answer the charger.
     """
 
-    def __init__(self, charger_id, connection):
-        super().__init__(charger_id, connection, logger=logging.getLogger(f"CSMS    {charger_id}"))
+    def __init__(self, charger_id, connection, clock):
+        super().__init__(charger_id, connection, logger=logging.getLogger(f"ocpp.CSMS.{charger_id}"))
+        self.clock = clock
         self.connector_status = "Unknown"
         self.transaction_id = None
         self.charge_power_kw = 0.0
         self.energy_meter_wh = 0.0
-        self.last_heartbeat_utc = None
-
-        # Newest time stamp the charger has sent us. The chargers run on a
-        # simulated clock, so the controller uses their time for its schedules.
-        self.charger_time_iso = None
+        self.state_of_charge_percent = None
+        self.last_heartbeat_time = None
 
     @on(Action.boot_notification)
     def on_boot_notification(self, charging_station, reason, **kwargs):
-        """A charger has just started and introduces itself. Accept it and give it a heartbeat interval."""
-        self.logger.info("%s: booted, %s %s", self.id, charging_station["vendor_name"], charging_station["model"])
+        """
+        A charger has just started and introduces itself. Accept it, give it a
+        heartbeat interval, and tell it the (simulated) time so its clock matches ours.
+        """
         return call_result.BootNotification(
-            current_time=utc_now_iso(),
+            current_time=self.clock.now().isoformat(),
             interval=settings.HEARTBEAT_INTERVAL_S,
             status=RegistrationStatusEnumType.accepted,
         )
@@ -132,14 +141,13 @@ class ChargerConnection(ChargePoint):
     @on(Action.heartbeat)
     def on_heartbeat(self, **kwargs):
         """The charger says it is still alive. Remember when, and reply with the time."""
-        self.last_heartbeat_utc = utc_now_iso()
-        return call_result.Heartbeat(current_time=self.last_heartbeat_utc)
+        self.last_heartbeat_time = self.clock.now()
+        return call_result.Heartbeat(current_time=self.last_heartbeat_time.isoformat())
 
     @on(Action.status_notification)
     def on_status_notification(self, timestamp, connector_status, evse_id, connector_id, **kwargs):
         """The connector changed state, for example Available (free) or Occupied (van plugged in)."""
         self.connector_status = connector_status
-        self.charger_time_iso = timestamp
         return call_result.StatusNotification()
 
     @on(Action.meter_values)
@@ -154,24 +162,32 @@ class ChargerConnection(ChargePoint):
         A charging session started, changed or ended. Keep the transaction id,
         because a power limit must name the transaction it is for.
         """
-        self.charger_time_iso = timestamp
-        if event_type == TransactionEventEnumType.ended:
-            self.transaction_id = None
-        else:
-            self.transaction_id = transaction_info["transaction_id"]
-
         if "meter_value" in kwargs:
             self.update_meter(kwargs["meter_value"])
+
+        if event_type == TransactionEventEnumType.ended:
+            # The van has gone: no transaction, no power, no battery to track.
+            self.transaction_id = None
+            self.charge_power_kw = 0.0
+            self.state_of_charge_percent = None
+        else:
+            self.transaction_id = transaction_info["transaction_id"]
         return call_result.TransactionEvent()
 
     def update_meter(self, meter_values):
-        """Store the newest power [kW] and energy [Wh] the charger reported."""
-        power_kw, energy_wh = read_power_and_energy(meter_values)
-        if power_kw is not None:
-            self.charge_power_kw = power_kw
-        if energy_wh is not None:
-            self.energy_meter_wh = energy_wh
+        """Store the newest power [kW], energy [Wh] and state of charge [%] the charger reported."""
+        values = read_meter_values(meter_values)
+        if values["power_kw"] is not None:
+            self.charge_power_kw = values["power_kw"]
+        if values["energy_wh"] is not None:
+            self.energy_meter_wh = values["energy_wh"]
+        if values["state_of_charge_percent"] is not None:
+            self.state_of_charge_percent = values["state_of_charge_percent"]
 
+
+# ---------------------------------------------------------------------------
+# Planning: sending power limits
+# ---------------------------------------------------------------------------
 
 async def send_power_limit(charger, limit_kw):
     """
@@ -180,34 +196,99 @@ async def send_power_limit(charger, limit_kw):
     In: ChargerConnection, power limit [kW].
     Out: the charger's answer, "Accepted" or "Rejected".
     """
-    profile = build_charging_profile(charger.transaction_id, limit_kw, charger.charger_time_iso)
+    profile = build_charging_profile(charger.transaction_id, limit_kw, charger.clock.now().isoformat())
     response = await charger.call(call.SetChargingProfile(evse_id=1, charging_profile=profile))
-    charger.logger.info("%s: limit %.1f kW -> %s", charger.id, limit_kw, response.status)
     return response.status
 
 
-async def planning_loop(connected_chargers, limit_kw, interval_s):
+async def planning_loop(connected_chargers, strategy, clock):
     """
-    Every interval_s real seconds, send a power limit to every charger that has a van charging.
+    Every planning interval, ask the strategy for power limits and send them.
 
-    In: dict of charger id -> ChargerConnection, limit [kW], cycle time [real seconds].
-    Runs forever.
+    In: dict of charger id -> ChargerConnection, a strategy function
+        (see strategies.py), the simulated clock. Runs forever.
     """
     while True:
-        await asyncio.sleep(interval_s)
+        await asyncio.sleep(clock.real_seconds(settings.PLANNING_INTERVAL_MINUTES))
+        limits_kw = strategy(connected_chargers)
 
-        # Copy the list first: a charger may connect or disconnect while we
-        # are waiting for an answer, and the dict must not change under our feet.
-        for charger in list(connected_chargers.values()):
-            if charger.transaction_id is not None:
+        for charger_id, limit_kw in limits_kw.items():
+            # A charger may have disconnected, or its van left, since the plan was made.
+            charger = connected_chargers.get(charger_id)
+            if charger is not None and charger.transaction_id is not None:
                 await send_power_limit(charger, limit_kw)
 
 
-async def handle_charger_connection(websocket, connected_chargers):
+# ---------------------------------------------------------------------------
+# Site monitor: total power against the grid limit
+# ---------------------------------------------------------------------------
+
+def take_site_sample(connected_chargers, sim_time):
+    """
+    Add up the site's power right now.
+
+    In: dict of connected chargers, simulated time.
+    Out: one site log sample (dict with time, building_kw, charging_kw, site_kw).
+    """
+    # Stage 2: the building load comes straight from the synthetic profile.
+    # From Stage 3 on it is read from the energy meter over Modbus.
+    building_kw = building_load_kw(sim_time)
+    charging_kw = sum(charger.charge_power_kw for charger in connected_chargers.values())
+    return {
+        "time": sim_time,
+        "building_kw": building_kw,
+        "charging_kw": charging_kw,
+        "site_kw": building_kw + charging_kw,
+    }
+
+
+def log_site_sample(sample, number_charging):
+    """Print one line about the site power, with a warning if it is over the limit."""
+    line = (f"{sample['time'].strftime('%H:%M')} | {number_charging:2d} vans charging | "
+            f"chargers {sample['charging_kw']:6.1f} kW | building {sample['building_kw']:5.1f} kW | "
+            f"site {sample['site_kw']:6.1f} kW of {settings.SITE_LIMIT_KW:.0f} kW")
+    if sample["site_kw"] > settings.SITE_LIMIT_KW:
+        line += f" | OVER LIMIT by {sample['site_kw'] - settings.SITE_LIMIT_KW:.1f} kW"
+    site_events.info(line)
+
+
+async def site_monitor_loop(connected_chargers, clock, site_log):
+    """
+    Every simulated minute, add a site sample to site_log.
+    Print a line once per quarter hour so the output stays readable. Runs forever.
+    """
+    last_printed_quarter = None
+    while True:
+        sample = take_site_sample(connected_chargers, clock.now())
+        site_log.append(sample)
+
+        quarter = (sample["time"].hour, sample["time"].minute // 15)
+        if quarter != last_printed_quarter:
+            number_charging = sum(1 for charger in connected_chargers.values() if charger.charge_power_kw > 0)
+            log_site_sample(sample, number_charging)
+            last_printed_quarter = quarter
+
+        await asyncio.sleep(clock.real_seconds(1))
+
+
+def log_night_summary(site_log):
+    """Print the peak site power and the time spent over the limit."""
+    peak_kw, peak_time = peak_site_power(site_log)
+    over_minutes = minutes_over_limit(site_log, settings.SITE_LIMIT_KW)
+    site_events.info("summary: peak site power %.1f kW at %s, %.0f minutes over the %.0f kW limit",
+                     peak_kw, peak_time.strftime("%H:%M"), over_minutes, settings.SITE_LIMIT_KW)
+
+
+# ---------------------------------------------------------------------------
+# Accepting chargers
+# ---------------------------------------------------------------------------
+
+async def handle_charger_connection(websocket, connected_chargers, clock, site_log):
     """
     Look after one charger from the moment it connects until it disconnects.
 
-    In: the open WebSocket, and the shared dict of connected chargers to add it to.
+    In: the open WebSocket, the shared dict of connected chargers to add it to,
+        the simulated clock, and the site log (for the summary when all chargers are gone).
     """
     # Both sides must have agreed on OCPP 2.0.1 when the connection opened.
     if websocket.subprotocol != settings.OCPP_SUBPROTOCOL:
@@ -216,48 +297,57 @@ async def handle_charger_connection(websocket, connected_chargers):
 
     # The charger's name is the last part of the address it connected to, e.g. /CP01.
     charger_id = websocket.request.path.strip("/")
-    charger = ChargerConnection(charger_id, websocket)
+    charger = ChargerConnection(charger_id, websocket, clock)
     connected_chargers[charger_id] = charger
-    logging.getLogger("CSMS").info("%s connected", charger_id)
 
     # start() keeps reading messages and answering them until the connection closes.
     try:
         await charger.start()
     except ConnectionClosed:
-        logging.getLogger("CSMS").info("%s disconnected", charger_id)
+        pass
     finally:
         del connected_chargers[charger_id]
 
+    # When the last charger has gone, the night is over: print how it went.
+    if not connected_chargers and site_log:
+        log_night_summary(site_log)
 
-async def start_csms_server(host, port, connected_chargers):
+
+async def start_csms_server(host, port, connected_chargers, clock, site_log):
     """
     Start listening for chargers.
 
     In: address and port to listen on (port 0 picks a free one, used in tests),
-        and the dict that will hold the connected chargers.
+        the dict that will hold the connected chargers, the simulated clock, the site log.
     Out: the running server.
     """
     async def on_new_connection(websocket):
-        await handle_charger_connection(websocket, connected_chargers)
+        await handle_charger_connection(websocket, connected_chargers, clock, site_log)
 
     return await serve(on_new_connection, host, port, subprotocols=[settings.OCPP_SUBPROTOCOL])
 
 
-async def run_csms():
-    """Start the server and the planning loop, using the values from settings.py. Runs forever."""
+async def run_csms(strategy):
+    """Start the server, the planning loop and the site monitor with the values from settings.py. Runs forever."""
+    clock = SimulationClock(settings.SIMULATION_START_TIME, settings.SIMULATED_SECONDS_PER_REAL_SECOND)
     connected_chargers = {}
-    await start_csms_server(settings.CSMS_HOST, settings.CSMS_PORT, connected_chargers)
-    logging.getLogger("CSMS").info("listening on ws://%s:%s", settings.CSMS_HOST, settings.CSMS_PORT)
+    site_log = []
 
-    # 15 simulated minutes, converted into real seconds at the chosen simulation speed.
-    planning_interval_s = settings.PLANNING_INTERVAL_MINUTES * 60 / settings.SIMULATED_SECONDS_PER_REAL_SECOND
-    await planning_loop(connected_chargers, DEMO_POWER_LIMIT_KW, planning_interval_s)
+    await start_csms_server(settings.CSMS_HOST, settings.CSMS_PORT, connected_chargers, clock, site_log)
+    site_events.info("listening on ws://%s:%s, strategy: %s, simulation speed: %sx",
+                     settings.CSMS_HOST, settings.CSMS_PORT, strategy.__name__,
+                     settings.SIMULATED_SECONDS_PER_REAL_SECOND)
+
+    # Run planning and monitoring side by side, forever.
+    await asyncio.gather(
+        planning_loop(connected_chargers, strategy, clock),
+        site_monitor_loop(connected_chargers, clock, site_log),
+    )
 
 
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(name)-14s | %(message)s")
-    logging.getLogger("websockets").setLevel(logging.WARNING)
-    asyncio.run(run_csms())
+    setup_logging()
+    asyncio.run(run_csms(strategies.uncontrolled))
 
 
 if __name__ == "__main__":
