@@ -156,11 +156,9 @@ async def test_smart_reports_in_advance_which_vans_will_be_short():
     forecasts = night["controller"].shortfall_forecasts
     forecast_2100 = [forecast for forecast in forecasts if forecast["time"].hour == 21][0]["shortfall_kwh"]
 
-    # It named the right vans: every van it called clearly short (more than 5 kWh, a few
-    # percent of the battery) really was, and the other way round. Smaller differences come
-    # from the small real losses the plan cannot see four hours ahead.
-    forecast_short = {van_id for van_id, kwh in forecast_2100.items() if kwh > 5.0}
-    actually_short = {van_id for van_id, kwh in actual_shortfall_kwh.items() if kwh > 5.0}
+    # It named the right vans: every van it called short really was short, and the other way round.
+    forecast_short = {van_id for van_id, kwh in forecast_2100.items() if kwh > 0.1}
+    actually_short = {van_id for van_id, kwh in actual_shortfall_kwh.items() if kwh > 0.1}
     assert forecast_short == actually_short
 
     # And the total it forecast is close to what was really missing (within 20 %).

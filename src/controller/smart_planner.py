@@ -89,19 +89,23 @@ def priority_order(vans):
                                                        vans[index]["charger_id"]))
 
 
-def shortfall_penalties(vans):
+def priority_weights(vans):
     """
-    The cost of one missing kWh for each van, so the vans first in priority_order are served
-    first when energy is short. The first van gets about twice the base penalty, the last one
-    the base penalty.
+    A weight for each van from its place in priority_order: about 2 for the first van,
+    falling evenly to just over 1 for the last one.
 
-    Out: list of penalties [EUR per kWh missing], in the same order as vans.
+    Both penalties in the model (missing energy at departure, and finishing late) are
+    multiplied by this weight. So when not every van can be served, the important vans
+    get their energy first AND are finished first. The last minutes before departure,
+    where small real delays cannot be made up any more, are then left to the vans
+    lowest in priority.
+
+    Out: list of weights, in the same order as vans.
     """
-    order = priority_order(vans)
-    penalties = [0.0] * len(vans)
-    for position, van_index in enumerate(order):
-        penalties[van_index] = settings.SHORTFALL_PENALTY_EUR_PER_KWH * (2 - position / len(vans))
-    return penalties
+    weights = [0.0] * len(vans)
+    for position, van_index in enumerate(priority_order(vans)):
+        weights[van_index] = 2 - position / len(vans)
+    return weights
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +136,7 @@ def build_model(vans, step_starts, capacity_kw, prices_eur_per_mwh, now):
                   * settings.CHARGING_EFFICIENCY for v in model.vans}
     room_to_full_kwh = {v: grid_energy_to_reach_kwh(vans[v]["state_of_charge_percent"], 100.0)
                         * settings.CHARGING_EFFICIENCY for v in model.vans}
-    penalties = shortfall_penalties(vans)
+    weights = priority_weights(vans)
 
     # Decisions:
     #   power_kw[v, t]     charging power of van v in step t (0 to 21.94 kW, the most a charger can get)
@@ -191,8 +195,10 @@ def build_model(vans, step_starts, capacity_kw, prices_eur_per_mwh, now):
     def total_cost_rule(model):
         electricity_eur = sum(prices_eur_per_mwh[t] / 1000 * model.power_kw[v, t] * hours[v, t]
                               for v in model.vans for t in model.steps)
-        shortfall_eur = sum(penalties[v] * model.shortfall_kwh[v] for v in model.vans)
-        late_eur = sum(settings.FINISH_LATE_PENALTY_EUR_PER_KWH * model.late_kwh[v] for v in model.vans)
+        shortfall_eur = sum(settings.SHORTFALL_PENALTY_EUR_PER_KWH * weights[v] * model.shortfall_kwh[v]
+                            for v in model.vans)
+        late_eur = sum(settings.FINISH_LATE_PENALTY_EUR_PER_KWH * weights[v] * model.late_kwh[v]
+                       for v in model.vans)
         waiting_eur = sum(EARLIER_IS_BETTER_EUR_PER_KWH_PER_STEP * t * model.power_kw[v, t] * hours[v, t]
                           for v in model.vans for t in model.steps)
         return electricity_eur + shortfall_eur + late_eur + waiting_eur

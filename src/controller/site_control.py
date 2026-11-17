@@ -132,6 +132,10 @@ class SiteController:
         self.shortfall_forecasts = []
         self.smart_plans = 0
         self.fallback_plans = 0
+        # How long each recent plan took from its start until its limits had all been sent
+        # (simulated time). The next smart plan starts its first quarter hour later by the
+        # typical delay (see expected_plan_delay), because that is when its limits begin to work.
+        self.recent_plan_delays = []
 
         self.building_kw = None
         self.site_log = []
@@ -233,6 +237,7 @@ class SiteController:
 
     async def plan(self, now, wanting_ids, rotate, regular):
         """Split the power available for charging between the vans and send the limits."""
+        plan_started = self.clock.now()
         reserved_kw = self.power_of_disconnected_chargers_kw()
         if self.strategy_name == "smart":
             limits_kw = await self.smart_limits(now, wanting_ids, reserved_kw, regular)
@@ -243,6 +248,18 @@ class SiteController:
         all_sent = await self.apply_limits(limits_kw)
         self.planned_charger_ids = set(wanting_ids)
         self.plan_is_unfinished = not all_sent
+        self.recent_plan_delays = (self.recent_plan_delays + [self.clock.now() - plan_started])[-8:]
+
+    def expected_plan_delay(self):
+        """
+        Out: the typical time from the start of a plan until its limits are sent (timedelta).
+
+        The median of the last 8 plans. A single slow plan (the computer was busy for a
+        moment) must not make the next plan think many minutes are lost.
+        """
+        if not self.recent_plan_delays:
+            return timedelta(0)
+        return sorted(self.recent_plan_delays)[len(self.recent_plan_delays) // 2]
 
     async def smart_limits(self, now, wanting_ids, reserved_kw, regular):
         """
@@ -267,7 +284,14 @@ class SiteController:
         if not vans:
             return {}
 
-        step_starts = plan_steps(now, vans)
+        # The new limits do not work from "now", but only once the plan is solved and sent.
+        # Until then the old limits keep running. So the plan's first quarter hour starts
+        # that much later (the typical delay of recent plans). Without this, a plan that switches a
+        # van from paused to full power counts the minutes before the limit arrives as
+        # charging time, and a van that needs full power until it leaves cannot make them up.
+        # Energy charged during the delay is not counted, which is on the safe side.
+        limits_start = now + self.expected_plan_delay()
+        step_starts = plan_steps(limits_start, vans)
         capacity_kw = []
         for step, step_start in enumerate(step_starts):
             building_kw = building_load_forecast_kw(step_start)
@@ -280,7 +304,7 @@ class SiteController:
 
         # Solving takes some tens of milliseconds. Doing it in a separate thread
         # (asyncio.to_thread) lets the chargers' messages keep flowing meanwhile.
-        plan = await asyncio.to_thread(plan_charging, vans, step_starts, capacity_kw, prices, now)
+        plan = await asyncio.to_thread(plan_charging, vans, step_starts, capacity_kw, prices, limits_start)
         self.smart_plans += 1
         if plan["used_fallback"]:
             self.fallback_plans += 1
