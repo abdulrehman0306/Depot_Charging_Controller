@@ -166,6 +166,8 @@ Writing never holds up the control loop: each write is a background task. If Inf
 
 Grafana loads the dashboard and the InfluxDB data source by itself when it starts, from `grafana/provisioning/`. The data source file holds no secrets: the token is filled in from the environment.
 
+Checked live (InfluxDB 2.7.11 and Grafana 11.5.2 in Docker, started from `docker-compose.yml` with the values from `.env`): InfluxDB set itself up with the `depot` bucket and accepted the token; Grafana's own health check of the provisioned data source answered "datasource is working. 3 buckets found"; the "Depot charging" dashboard was loaded from the JSON file with its 5 panels and is the home page. One smart night of the normal scenario (simulation speed 600) then stored 816 control cycles: 4,896 site values, 30,797 charger values and 816 prices, with no failed writes. The highest site power stored in InfluxDB, 135.0 kW at 01:31, is the same as the controller's own end-of-night summary.
+
 ### REST API
 
 The controller program also serves a REST API (FastAPI) on http://127.0.0.1:8000. FastAPI makes an interactive page with all endpoints at http://127.0.0.1:8000/docs.
@@ -199,7 +201,15 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-Create `.env` as described under "Secrets". InfluxDB and Grafana are started with Docker (Stage 7). Then start three programs in three terminals, in this order:
+Create `.env` as described under "Secrets". Start InfluxDB and Grafana with Docker (Docker Desktop must be running):
+
+```
+docker compose up -d
+```
+
+Grafana is then at http://localhost:3000 (log in with `GRAFANA_ADMIN_USER` and `GRAFANA_ADMIN_PASSWORD` from your `.env`), InfluxDB at http://localhost:8086.
+
+Then start three programs in three terminals, in this order:
 
 ```
 python -m src.meter.modbus_meter

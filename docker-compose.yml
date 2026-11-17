@@ -1,0 +1,49 @@
+# Starts InfluxDB (the database) and Grafana (the dashboard) with one command:
+#     docker compose up -d
+# Stage 7 adds the controller, the chargers and the meter to this file.
+#
+# All secrets come from the .env file (see .env.example); none are written here.
+
+services:
+  influxdb:
+    image: influxdb:2.7.11
+    ports:
+      - "8086:8086"
+    environment:
+      # On the very first start, InfluxDB sets itself up with this user, organisation,
+      # bucket and token. Later starts reuse what is stored in the influxdb-data volume.
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: ${INFLUXDB_ADMIN_USER}
+      DOCKER_INFLUXDB_INIT_PASSWORD: ${INFLUXDB_ADMIN_PASSWORD}
+      DOCKER_INFLUXDB_INIT_ORG: ${INFLUXDB_ORG}
+      DOCKER_INFLUXDB_INIT_BUCKET: ${INFLUXDB_BUCKET}
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUXDB_TOKEN}
+    volumes:
+      - influxdb-data:/var/lib/influxdb2
+
+  grafana:
+    image: grafana/grafana:11.5.2
+    ports:
+      - "3000:3000"
+    depends_on:
+      - influxdb
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      # Open the depot dashboard as the home page.
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/depot_charging.json
+      # Used by grafana/provisioning/datasources/influxdb.yml. Inside Docker, Grafana
+      # reaches InfluxDB by its service name, not by "localhost".
+      INFLUXDB_URL: http://influxdb:8086
+      INFLUXDB_ORG: ${INFLUXDB_ORG}
+      INFLUXDB_BUCKET: ${INFLUXDB_BUCKET}
+      INFLUXDB_TOKEN: ${INFLUXDB_TOKEN}
+    volumes:
+      # The provisioning files and the dashboard JSON come straight from this repository.
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+
+volumes:
+  influxdb-data:
+  grafana-data:
