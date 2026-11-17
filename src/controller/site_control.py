@@ -5,7 +5,8 @@ Once per simulated minute, like a PLC scan cycle:
 1. Read the building load from the meter (Modbus TCP).
 2. Log the measured site power: building + what the chargers report over OCPP.
 3. Decide whether a new plan is needed, and if so, plan and send the limits:
-   - every quarter hour (regular plan, the equal sharing queue rotates);
+   - every quarter hour (regular plan; equal sharing rotates its queue,
+     the smart controller solves its optimisation again with the newest state);
    - when the set of vans wanting power changes (a van arrived, filled up or left);
    - SAFETY: when the estimated site power is above the planning target.
 
@@ -19,18 +20,26 @@ that power. Counting the reported power means a van that has not yet obeyed
 a lower limit is still counted at its old, higher power.
 
 Planning target = site limit - safety margin (see SAFETY_MARGIN_KW in settings.py).
+
+A charger that loses its connection keeps charging with its last limit. The controller
+keeps counting it at that power and leaves that power out of every plan until the
+charger is back.
 """
 
 import asyncio
 import logging
+from datetime import timedelta
 
 from ocpp.v201.enums import ChargingStateEnumType
 
 import settings
 from src.controller.central_system import send_power_limit
 from src.controller.meter_reader import MeterReadError, read_meter, write_meter_clock
+from src.controller.smart_planner import plan_charging, plan_steps, warm_up_solver
 from src.controller.strategies import equal_sharing
 from src.electrical import charging_current_limit_a
+from src.meter.building_load import BUILDING_LOAD_BY_HOUR_KW
+from src.prices import price_at
 from src.results import minutes_over_limit, over_limit_episodes, peak_site_power, spike_reaction_minutes
 from src.scenarios import get_scenario
 
@@ -64,6 +73,18 @@ def wants_power(charger):
     return charger.transaction_id is not None and charger.charging_state != ChargingStateEnumType.suspended_ev
 
 
+def building_load_forecast_kw(sim_time):
+    """
+    The building load the smart controller expects at a future time [kW].
+
+    A real depot would make this forecast from weeks of its own meter data (for example
+    the average of the same weekday and hour). Here the controller is simply given the
+    typical daily profile, which is a best case: it knows the normal daily pattern, but
+    not unplanned events like the load spike. Those are the safety layer's job.
+    """
+    return float(BUILDING_LOAD_BY_HOUR_KW[sim_time.hour])
+
+
 def expected_charging_power_kw(charger):
     """
     The power the safety layer counts for one charger [kW].
@@ -83,10 +104,17 @@ class SiteController:
     when it last planned, and the site log.
     """
 
-    def __init__(self, connected_chargers, clock, meter_client, strategy_name,
+    def __init__(self, chargers_by_id, clock, meter_client, strategy_name,
                  site_limit_kw=settings.SITE_LIMIT_KW, safety_margin_kw=settings.SAFETY_MARGIN_KW,
-                 scenario_name=None):
-        self.connected_chargers = connected_chargers
+                 scenario_name=None, fleet_schedule=None, prices=None):
+        """
+        In: dict of all chargers by id, simulated clock, Modbus client for the meter,
+            strategy name ("uncontrolled", "equal_sharing" or "smart"), site limit [kW],
+            safety margin [kW], scenario name (only for the report), and for the smart
+            controller: the fleet schedule (van id -> departure time) and the day-ahead
+            prices (pandas Series, see src/prices.py).
+        """
+        self.chargers_by_id = chargers_by_id
         self.clock = clock
         self.meter_client = meter_client
         self.strategy_name = strategy_name
@@ -94,6 +122,16 @@ class SiteController:
         self.safety_margin_kw = safety_margin_kw
         # Only used to label the end-of-night report, never for decisions.
         self.scenario_name = scenario_name
+        # Smart controller inputs. The fleet schedule is what the depot's route planning
+        # knows: when each van must leave. The van id comes from its RFID card over OCPP.
+        self.fleet_schedule = fleet_schedule or {}
+        self.prices = prices
+        # Smart controller results: the energy each van is expected to be missing at departure.
+        self.planned_shortfall_kwh = {}
+        # Every regular plan's forecast: dicts with time and shortfall_kwh (van id -> kWh).
+        self.shortfall_forecasts = []
+        self.smart_plans = 0
+        self.fallback_plans = 0
 
         self.building_kw = None
         self.site_log = []
@@ -119,7 +157,7 @@ class SiteController:
 
     def estimated_site_kw(self):
         """Out: building load from the meter + expected power of every charger [kW]."""
-        charging_kw = sum(expected_charging_power_kw(charger) for charger in self.connected_chargers.values())
+        charging_kw = sum(expected_charging_power_kw(charger) for charger in self.chargers_by_id.values())
         return self.building_kw + charging_kw
 
     # -----------------------------------------------------------------------
@@ -133,6 +171,9 @@ class SiteController:
         Like a cyclic interrupt in a PLC (OB35) rather than a free cycle (OB1): each cycle
         starts one minute after the previous one started, however long the work took.
         """
+        if self.strategy_name == "smart":
+            await asyncio.to_thread(warm_up_solver)
+
         while True:
             cycle_start = self.clock.now()
             await self.control_cycle()
@@ -153,8 +194,9 @@ class SiteController:
 
     async def plan_if_needed(self, now):
         """Make a new plan if it is a new quarter hour, the vans changed, or the safety layer says so."""
-        wanting_ids = sorted(charger_id for charger_id, charger in self.connected_chargers.items()
-                             if wants_power(charger))
+        # Only connected chargers can be given new limits.
+        wanting_ids = sorted(charger_id for charger_id, charger in self.chargers_by_id.items()
+                             if charger.is_connected and wants_power(charger))
         reason = None
         rotate = False
 
@@ -177,16 +219,96 @@ class SiteController:
             reason = reason or "finish the last plan"
 
         if reason is not None:
-            await self.plan(wanting_ids, rotate)
+            await self.plan(now, wanting_ids, rotate, regular=(reason == "regular plan"))
 
-    async def plan(self, wanting_ids, rotate):
+    def power_of_disconnected_chargers_kw(self):
+        """
+        Power still drawn by chargers that lost their connection [kW].
+
+        They keep charging with their last limit, and we cannot change it, so this
+        power is not available for the other vans until they are back.
+        """
+        return sum(expected_charging_power_kw(charger) for charger in self.chargers_by_id.values()
+                   if not charger.is_connected)
+
+    async def plan(self, now, wanting_ids, rotate, regular):
         """Split the power available for charging between the vans and send the limits."""
-        self.update_rotation_queue(wanting_ids, rotate)
-        available_kw = self.target_kw() - self.building_kw
-        limits_kw = equal_sharing(self.rotation_queue, available_kw)
+        reserved_kw = self.power_of_disconnected_chargers_kw()
+        if self.strategy_name == "smart":
+            limits_kw = await self.smart_limits(now, wanting_ids, reserved_kw, regular)
+        else:
+            self.update_rotation_queue(wanting_ids, rotate)
+            available_kw = self.target_kw() - self.building_kw - reserved_kw
+            limits_kw = equal_sharing(self.rotation_queue, available_kw)
         all_sent = await self.apply_limits(limits_kw)
         self.planned_charger_ids = set(wanting_ids)
         self.plan_is_unfinished = not all_sent
+
+    async def smart_limits(self, now, wanting_ids, reserved_kw, regular):
+        """
+        Ask the smart planner for this quarter hour's limits.
+
+        In: present time, ids of chargers whose vans want power, power reserved for
+            disconnected chargers [kW], and whether this is a regular quarter hour plan.
+        Out: dict charger id -> power limit [kW].
+        """
+        vans = []
+        for charger_id in wanting_ids:
+            charger = self.chargers_by_id[charger_id]
+            departure_time = self.fleet_schedule.get(charger.van_id)
+            if departure_time is None:
+                # A van that is not in the schedule: plan as if it must leave in 8 hours.
+                departure_time = now + timedelta(hours=8)
+                self.events.warning("van %s on %s is not in the fleet schedule", charger.van_id, charger_id)
+            vans.append({"charger_id": charger_id, "van_id": charger.van_id,
+                         "state_of_charge_percent": charger.state_of_charge_percent,
+                         "arrival_state_of_charge_percent": charger.arrival_state_of_charge_percent,
+                         "departure_time": departure_time})
+        if not vans:
+            return {}
+
+        step_starts = plan_steps(now, vans)
+        capacity_kw = []
+        for step, step_start in enumerate(step_starts):
+            building_kw = building_load_forecast_kw(step_start)
+            if step == 0:
+                # For the step that starts now, the meter is better than any forecast,
+                # unless the forecast is higher (a rise expected later in this quarter hour).
+                building_kw = max(self.building_kw, building_kw)
+            capacity_kw.append(max(0.0, self.target_kw() - building_kw - reserved_kw))
+        prices = self.prices_for_steps(step_starts)
+
+        # Solving takes some tens of milliseconds. Doing it in a separate thread
+        # (asyncio.to_thread) lets the chargers' messages keep flowing meanwhile.
+        plan = await asyncio.to_thread(plan_charging, vans, step_starts, capacity_kw, prices, now)
+        self.smart_plans += 1
+        if plan["used_fallback"]:
+            self.fallback_plans += 1
+            self.events.warning("%s optimiser not used (%s): fallback rule, most urgent van first",
+                                now.strftime("%H:%M:%S"), plan["reason"])
+        else:
+            self.report_planned_shortfalls(now, plan["shortfall_kwh"], regular)
+        return plan["limits_kw"]
+
+    def prices_for_steps(self, step_starts):
+        """Out: the day-ahead price of each step [EUR/MWh], or None if any price is missing."""
+        if self.prices is None:
+            return None
+        try:
+            return [price_at(self.prices, step_start) for step_start in step_starts]
+        except KeyError as error:
+            self.events.warning("missing price: %s", error)
+            return None
+
+    def report_planned_shortfalls(self, now, shortfall_kwh, regular):
+        """Remember which vans the plan expects to be short, and print them at each regular plan."""
+        self.planned_shortfall_kwh.update(shortfall_kwh)
+        if regular:
+            self.shortfall_forecasts.append({"time": now, "shortfall_kwh": dict(shortfall_kwh)})
+        short_vans = {van_id: kwh for van_id, kwh in shortfall_kwh.items() if kwh > 0.05}
+        if short_vans and regular:
+            text = ", ".join(f"{van_id} short by {kwh:.1f} kWh" for van_id, kwh in sorted(short_vans.items()))
+            self.events.warning("%s PLAN: not enough power before departure: %s", now.strftime("%H:%M"), text)
 
     def update_rotation_queue(self, wanting_ids, rotate):
         """
@@ -201,7 +323,7 @@ class SiteController:
         # vans that had to wait come to the front. With enough power for everyone
         # nobody waits, and the order does not change.
         if rotate:
-            waited = [charger_id for charger_id in queue if self.connected_chargers[charger_id].allowed_power_kw == 0]
+            waited = [charger_id for charger_id in queue if self.chargers_by_id[charger_id].allowed_power_kw == 0]
             charged = [charger_id for charger_id in queue if charger_id not in waited]
             queue = waited + charged
 
@@ -223,8 +345,8 @@ class SiteController:
         decreases = []
         increases = []
         for charger_id, limit_kw in limits_kw.items():
-            charger = self.connected_chargers.get(charger_id)
-            if charger is None or charger.transaction_id is None:
+            charger = self.chargers_by_id.get(charger_id)
+            if charger is None or charger.transaction_id is None or not charger.is_connected:
                 continue
             # Compare in amps, the unit actually sent, so rounding does not cause needless messages.
             new_limit_a = charging_current_limit_a(limit_kw)
@@ -280,7 +402,7 @@ class SiteController:
         """In: list of ChargerConnection. Out: True if each one reports at most its allowed power."""
         for charger in chargers:
             # A charger that disconnected or whose van left or filled up draws nothing more.
-            still_connected = self.connected_chargers.get(charger.id) is charger
+            still_connected = self.chargers_by_id.get(charger.id) is charger and charger.is_connected
             if still_connected and wants_power(charger) and \
                     charger.charge_power_kw > charger.allowed_power_kw + POWER_TOLERANCE_KW:
                 return False
@@ -292,7 +414,7 @@ class SiteController:
 
     def record_sample(self, now):
         """Store the measured site power and print a line each quarter hour or while over the limit."""
-        charging_kw = sum(charger.charge_power_kw for charger in self.connected_chargers.values())
+        charging_kw = sum(charger.charge_power_kw for charger in self.chargers_by_id.values())
         sample = {
             "time": now,
             "building_kw": self.building_kw,
@@ -305,7 +427,7 @@ class SiteController:
         quarter = (now.hour, now.minute // 15)
         is_over_limit = sample["site_kw"] > self.site_limit_kw + POWER_TOLERANCE_KW
         if quarter != self.last_printed_quarter or is_over_limit:
-            number_charging = sum(1 for charger in self.connected_chargers.values() if charger.charge_power_kw > 0)
+            number_charging = sum(1 for charger in self.chargers_by_id.values() if charger.charge_power_kw > 0)
             line = (f"{now.strftime('%H:%M:%S')} | {number_charging:2d} vans charging | "
                     f"chargers {charging_kw:6.1f} kW | building {self.building_kw:5.1f} kW | "
                     f"site {sample['site_kw']:6.1f} kW of {self.site_limit_kw:.0f} kW")
@@ -316,7 +438,7 @@ class SiteController:
 
     def report_if_night_is_over(self):
         """When the last charger has disconnected, print how the night went (once)."""
-        if self.connected_chargers:
+        if any(charger.is_connected for charger in self.chargers_by_id.values()):
             self.had_chargers = True
             return
         if self.had_chargers and not self.summary_printed:
@@ -333,6 +455,9 @@ class SiteController:
         for start, end in over_limit_episodes(self.site_log, self.site_limit_kw):
             end_text = end.strftime("%H:%M:%S") if end is not None else "end of log"
             self.events.info("summary: measured over the limit from %s to %s", start.strftime("%H:%M:%S"), end_text)
+        if self.strategy_name == "smart":
+            self.events.info("summary: %d smart plans, %d of them used the fallback rule",
+                             self.smart_plans, self.fallback_plans)
 
         # The spike times come from the scenario. They are used only here, to measure the reaction.
         if self.scenario_name is not None:

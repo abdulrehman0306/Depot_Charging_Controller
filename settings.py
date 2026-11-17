@@ -7,7 +7,9 @@ _s = real seconds, _minutes = simulated minutes.
 """
 
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
 # ---------------------------------------------------------------------------
 # Chargers
@@ -57,9 +59,44 @@ PLANNING_INTERVAL_MINUTES = 15
 # until the next plan (the safe choice).
 REDUCTION_CONFIRM_TIMEOUT_MINUTES = 2
 
-# Which charging strategy the controller uses: "uncontrolled" or "equal_sharing".
+# Which charging strategy the controller uses: "uncontrolled", "equal_sharing" or "smart".
 # Change without editing this file:  set STRATEGY=uncontrolled
-STRATEGY = os.environ.get("STRATEGY", "equal_sharing")
+STRATEGY = os.environ.get("STRATEGY", "smart")
+
+# Smart controller: every kWh a van is missing at departure (below the 90 % target)
+# counts as this many euros in the optimisation. It is far higher than any
+# electricity price, so the optimiser always charges every van it can first,
+# and only then looks for the cheapest quarter hours.
+SHORTFALL_PENALTY_EUR_PER_KWH = 100.0
+
+# Smart controller: the plan aims this much above the 90 % target. Small real losses
+# would otherwise leave a van just under 90 %: limits are rounded down to 0.1 A,
+# a plan reaches the charger a moment after it was made, and a planned power below
+# 4.14 kW becomes 0 because of the 6 A rule. 2 % of 75 kWh is 1.5 kWh.
+PLANNING_RESERVE_PERCENT = 2.0
+
+# Smart controller: the plan wants every van finished this long before it leaves,
+# so a delay or a short disturbance in the last minutes does not leave it short.
+# Energy still missing at that point costs FINISH_LATE_PENALTY_EUR_PER_KWH in the
+# optimisation: about ten times an electricity price, so finishing early wins
+# whenever it is possible, but far less than a real shortfall, so the last minutes
+# are still used when they are needed.
+PLANNING_FINISH_EARLY_MINUTES = 30
+FINISH_LATE_PENALTY_EUR_PER_KWH = 1.0
+
+# Smart controller: give up on the optimiser after this many real seconds and
+# use the simple fallback rule for this plan instead.
+SOLVER_TIME_LIMIT_S = 10
+
+# ---------------------------------------------------------------------------
+# Day-ahead prices (real data, SMARD.de)
+# ---------------------------------------------------------------------------
+# SMARD chart data API: series 4169 = day-ahead price for the DE-LU bidding
+# zone, quarter hours, EUR/MWh. Same source and loading code as my
+# battery-revenue-study project.
+SMARD_PRICE_SERIES_ID = "4169"
+SMARD_PRICE_REGION = "DE-LU"
+PRICE_DATA_FOLDER = Path(__file__).resolve().parent / "data" / "prices"
 
 # Which test scenario the meter and the chargers play (see src/scenarios.py).
 # The controller only uses it to label its report, never to make decisions.
@@ -106,9 +143,23 @@ ARRIVAL_STATE_OF_CHARGE_MAX_PERCENT = 50.0
 # The controller and the chargers must use the same speed.
 SIMULATED_SECONDS_PER_REAL_SECOND = int(os.environ.get("SIM_SPEED", "60"))
 
-# Simulated time when a run starts: just before the first van can arrive.
-# German winter time (CET, UTC+1). Summer time is not handled yet.
-SIMULATION_START_TIME = datetime(2025, 1, 15, 15, 30, tzinfo=timezone(timedelta(hours=1)))
+# German local time, with summer and winter time. Nights with a clock change
+# (last Sunday of March and of October) are not used: src/scenarios.py checks it.
+TIMEZONE = ZoneInfo("Europe/Berlin")
+
+# The nights the scenarios play, chosen from the real SMARD price data:
+# - a normal winter weekday night (Wednesday to Thursday),
+# - the night in the data with the most negative prices between 20:00 and 06:00
+#   (Saturday to Sunday, 35 negative quarter hours, lowest -5.09 EUR/MWh).
+NORMAL_NIGHT_DATE = date(2026, 1, 14)
+NEGATIVE_PRICE_NIGHT_DATE = date(2025, 10, 4)
+
+# A run starts at this clock time on the night's date: just before the first van can arrive.
+SIMULATION_START_CLOCK = "15:30"
+
+# Start of the normal night. Used where no scenario is given (for example in small tests).
+SIMULATION_START_TIME = datetime(NORMAL_NIGHT_DATE.year, NORMAL_NIGHT_DATE.month, NORMAL_NIGHT_DATE.day,
+                                 15, 30, tzinfo=TIMEZONE)
 
 # ---------------------------------------------------------------------------
 # OCPP connection between chargers and the controller (CSMS)

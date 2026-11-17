@@ -16,6 +16,7 @@ from ocpp.routing import after, on
 from ocpp.v201 import ChargePoint, call, call_result
 from ocpp.v201.enums import (
     Action,
+    AuthorizationStatusEnumType,
     ChargingProfileKindEnumType,
     ChargingProfilePurposeEnumType,
     ChargingProfileStatusEnumType,
@@ -155,6 +156,31 @@ class ChargerConnection(ChargePoint):
         # Lets the tests check that no limit between 0 and 6 A was ever sent.
         self.sent_limits_a = []
 
+        # Which van is plugged in (from its RFID card), its state of charge when it plugged in,
+        # and whether the charger is connected now.
+        self.van_id = None
+        self.arrival_state_of_charge_percent = None
+        self.is_connected = True
+
+    def take_over_state_from(self, old_connection):
+        """
+        A charger has reconnected: carry over everything we knew from its old connection.
+
+        Without this the controller would forget that a van is charging there, and would
+        give that power to other vans while this one still draws it.
+        """
+        self.connector_status = old_connection.connector_status
+        self.transaction_id = old_connection.transaction_id
+        self.charging_state = old_connection.charging_state
+        self.charge_power_kw = old_connection.charge_power_kw
+        self.energy_meter_wh = old_connection.energy_meter_wh
+        self.state_of_charge_percent = old_connection.state_of_charge_percent
+        self.allowed_current_a = old_connection.allowed_current_a
+        self.allowed_power_kw = old_connection.allowed_power_kw
+        self.sent_limits_a = old_connection.sent_limits_a
+        self.van_id = old_connection.van_id
+        self.arrival_state_of_charge_percent = old_connection.arrival_state_of_charge_percent
+
     @on(Action.boot_notification)
     def on_boot_notification(self, charging_station, reason, **kwargs):
         """
@@ -210,6 +236,11 @@ class ChargerConnection(ChargePoint):
 
         if event_type == TransactionEventEnumType.started:
             self.transaction_id = transaction_info["transaction_id"]
+            # The van's RFID card tells us which van it is (see the fleet schedule).
+            if kwargs.get("id_token") is not None:
+                self.van_id = kwargs["id_token"]["id_token"]
+            # The state of charge in the Started event is the one the van came back with.
+            self.arrival_state_of_charge_percent = self.state_of_charge_percent
             # The new transaction starts with the default limit we gave the charger.
             if self.default_limit_a is None:
                 self.set_allowed_current(settings.CHARGER_MAX_CURRENT_A)
@@ -220,7 +251,14 @@ class ChargerConnection(ChargePoint):
             self.transaction_id = None
             self.charge_power_kw = 0.0
             self.state_of_charge_percent = None
+            self.van_id = None
+            self.arrival_state_of_charge_percent = None
             self.set_allowed_current(0.0)
+
+        # OCPP 2.0.1: if the charger sent an idToken, the answer must say whether it is accepted.
+        # Every van card of the depot is accepted.
+        if kwargs.get("id_token") is not None:
+            return call_result.TransactionEvent(id_token_info={"status": AuthorizationStatusEnumType.accepted})
         return call_result.TransactionEvent()
 
     def update_meter(self, meter_values):
@@ -257,12 +295,16 @@ async def send_power_limit(charger, limit_kw):
     return response.status
 
 
-async def handle_charger_connection(websocket, connected_chargers, clock, default_limit_a):
+async def handle_charger_connection(websocket, chargers_by_id, clock, default_limit_a):
     """
     Look after one charger from the moment it connects until it disconnects.
 
-    In: the open WebSocket, the shared dict of connected chargers to add it to,
+    In: the open WebSocket, the shared dict of all chargers to add it to,
         the simulated clock, the default current limit [A] for new transactions (or None).
+
+    A charger that disconnects stays in the dict, marked as not connected: its van may
+    still be charging with the last limit. If it reconnects, the new connection takes
+    over what the controller knew about it.
     """
     # Both sides must have agreed on OCPP 2.0.1 when the connection opened.
     if websocket.subprotocol != settings.OCPP_SUBPROTOCOL:
@@ -272,7 +314,11 @@ async def handle_charger_connection(websocket, connected_chargers, clock, defaul
     # The charger's name is the last part of the address it connected to, e.g. /CP01.
     charger_id = websocket.request.path.strip("/")
     charger = ChargerConnection(charger_id, websocket, clock, default_limit_a)
-    connected_chargers[charger_id] = charger
+    events = logging.getLogger("CSMS")
+    if charger_id in chargers_by_id:
+        charger.take_over_state_from(chargers_by_id[charger_id])
+        events.info("%s %s reconnected", clock.now().strftime("%H:%M:%S"), charger_id)
+    chargers_by_id[charger_id] = charger
 
     # start() keeps reading messages and answering them until the connection closes.
     try:
@@ -280,19 +326,23 @@ async def handle_charger_connection(websocket, connected_chargers, clock, defaul
     except ConnectionClosed:
         pass
     finally:
-        del connected_chargers[charger_id]
+        charger.is_connected = False
+        if charger.transaction_id is not None:
+            events.warning("%s %s disconnected while a van is plugged in; counting it at %.1f kW until it is back",
+                           clock.now().strftime("%H:%M:%S"), charger_id,
+                           max(charger.charge_power_kw, charger.allowed_power_kw))
 
 
-async def start_csms_server(host, port, connected_chargers, clock, default_limit_a=None):
+async def start_csms_server(host, port, chargers_by_id, clock, default_limit_a=None):
     """
     Start listening for chargers.
 
     In: address and port to listen on (port 0 picks a free one, used in tests),
-        the dict that will hold the connected chargers, the simulated clock,
+        the dict that will hold all chargers (by id), the simulated clock,
         the default current limit [A] for new transactions (None = no default).
     Out: the running server.
     """
     async def on_new_connection(websocket):
-        await handle_charger_connection(websocket, connected_chargers, clock, default_limit_a)
+        await handle_charger_connection(websocket, chargers_by_id, clock, default_limit_a)
 
     return await serve(on_new_connection, host, port, subprotocols=[settings.OCPP_SUBPROTOCOL])

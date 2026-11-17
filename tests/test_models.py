@@ -6,6 +6,7 @@ All are checked against numbers worked out by hand.
 
 from datetime import timedelta
 
+import pandas as pd
 import pytest
 
 import settings
@@ -14,6 +15,7 @@ from src.electrical import charging_current_limit_a, current_a_to_power_kw, powe
 from src.meter.building_load import LoadSpike, building_load_kw
 from src.results import (
     charger_power_at,
+    charging_cost_eur,
     minutes_over_limit,
     over_limit_episodes,
     peak_site_power,
@@ -169,3 +171,12 @@ def test_true_site_power_uses_what_the_charger_really_drew():
     power_log = [{"start": START, "end": START + timedelta(minutes=10), "power_kw": 11.0}]
     assert charger_power_at(power_log, START + timedelta(minutes=5)) == 11.0
     assert charger_power_at(power_log, START + timedelta(minutes=10)) == 0.0
+
+
+def test_charging_cost_splits_a_step_at_the_quarter_hour():
+    # 12 kW from 10:10 to 10:20: 1 kWh before 10:15 at 100 EUR/MWh, 1 kWh after at 200 EUR/MWh.
+    ten = START.replace(hour=10, minute=0)
+    prices = pd.Series([100.0, 200.0], index=pd.DatetimeIndex([ten, ten + timedelta(minutes=15)]))
+    power_log = [{"start": ten + timedelta(minutes=10), "end": ten + timedelta(minutes=20), "power_kw": 12.0}]
+    # 1 kWh x 0.100 EUR/kWh + 1 kWh x 0.200 EUR/kWh = 0.30 EUR
+    assert charging_cost_eur([power_log], prices) == pytest.approx(0.30)

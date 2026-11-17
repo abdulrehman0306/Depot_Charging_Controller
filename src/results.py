@@ -17,6 +17,7 @@ from datetime import timedelta
 
 import settings
 from src.meter.building_load import building_load_kw
+from src.prices import price_at
 
 # Power values within this much of the limit count as "at the limit", not over it.
 POWER_TOLERANCE_KW = 0.01
@@ -130,6 +131,38 @@ def true_site_log(power_logs, load_spikes, start_time, end_time):
                          "site_kw": building_kw + charging_kw})
         sim_time += timedelta(minutes=1)
     return site_log
+
+
+def next_quarter_hour(sim_time):
+    """In: a time. Out: the start of the next quarter hour after it."""
+    minutes_into_quarter = sim_time.minute % 15
+    quarter_start = sim_time.replace(minute=sim_time.minute - minutes_into_quarter, second=0, microsecond=0)
+    return quarter_start + timedelta(minutes=15)
+
+
+def charging_cost_eur(power_logs, prices):
+    """
+    What the charging energy cost at the day-ahead price.
+
+    Only the wholesale energy price is counted (what the depot's supplier would pass
+    on with a dynamic tariff). Grid fees, taxes and levies are the same for every
+    strategy, so they are left out.
+
+    In: list of charger power logs (steps with start, end, power_kw), price Series from src/prices.py.
+    Out: cost [EUR]. Negative if the vans were paid to charge (negative prices).
+    """
+    total_eur = 0.0
+    for power_log in power_logs:
+        for step in power_log:
+            # A step may cross a quarter hour boundary. Split it there, so each part
+            # is paid at the price of its own quarter hour.
+            piece_start = step["start"]
+            while piece_start < step["end"]:
+                piece_end = min(step["end"], next_quarter_hour(piece_start))
+                energy_kwh = step["power_kw"] * (piece_end - piece_start).total_seconds() / 3600
+                total_eur += energy_kwh * price_at(prices, piece_start) / 1000
+                piece_start = piece_end
+    return total_eur
 
 
 def van_results(vans, completed_visits):

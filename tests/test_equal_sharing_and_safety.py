@@ -1,5 +1,7 @@
 """
-Stage 4 tests: equal sharing, the 6 A rule over whole nights, and the safety layer.
+Equal sharing and the safety layer: the sharing rule, the rotation queue, the safety
+estimate, the impossible night, the 60 kW night (rotation), and the load spike.
+The checks that every strategy must pass in every scenario are in test_scenarios.py.
 
 "True" site power below means the power that really flowed, rebuilt from what
 every charger really drew plus the real building load. The controller itself
@@ -21,8 +23,6 @@ from src.scenarios import clock_time_on_day, get_scenario
 from tests.conftest import run_night, run_scenario_night
 
 DAY = settings.SIMULATION_START_TIME.date()
-SCENARIOS_WITHOUT_SPIKE = ["normal_evening", "rush", "late_van", "impossible"]
-SCENARIOS_WHERE_EVERY_VAN_CAN_MAKE_IT = ["normal_evening", "rush", "late_van", "load_spike"]
 
 
 def all_completed_visits(night):
@@ -111,28 +111,7 @@ def test_safety_estimate_counts_the_higher_of_reported_and_allowed_power():
 # Whole nights with equal sharing
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("scenario_name", SCENARIOS_WITHOUT_SPIKE)
-async def test_site_power_never_goes_over_the_limit(scenario_name):
-    night = await run_scenario_night(scenario_name, "equal_sharing")
-    assert minutes_over_limit(night["true_site_log"], settings.SITE_LIMIT_KW) == 0.0
-
-
-@pytest.mark.parametrize("scenario_name", SCENARIOS_WITHOUT_SPIKE + ["load_spike"])
-async def test_no_limit_between_0_and_6_amps_and_none_above_22_kw(scenario_name):
-    night = await run_scenario_night(scenario_name, "equal_sharing")
-    for sent in night["controller"].sent_limits:
-        assert sent["limit_a"] == 0.0 or sent["limit_a"] >= settings.CHARGER_MIN_CURRENT_A
-    for charger in night["chargers"]:
-        assert max(step["power_kw"] for step in charger.power_log) <= settings.CHARGER_MAX_POWER_KW
-
-
-@pytest.mark.parametrize("scenario_name", SCENARIOS_WHERE_EVERY_VAN_CAN_MAKE_IT)
-async def test_every_van_reaches_90_percent_when_possible(scenario_name):
-    night = await run_scenario_night(scenario_name, "equal_sharing")
-    for result in van_results(night["vans"], all_completed_visits(night)):
-        assert result["reached_target"], result
-
-
+@pytest.mark.night
 async def test_impossible_case_reports_the_shortfall_correctly():
     night = await run_scenario_night("impossible", "equal_sharing")
     results = van_results(night["vans"], all_completed_visits(night))
@@ -153,6 +132,7 @@ async def test_impossible_case_reports_the_shortfall_correctly():
     assert total_grid_kwh <= 586.0 + 0.5
 
 
+@pytest.mark.night
 async def test_no_van_waits_all_night_when_power_is_short():
     # With a 60 kW limit there is not enough power for every van at once (45 kW target minus
     # the building load leaves room for only 2 to 5 vans), so equal sharing has to rotate.
@@ -182,6 +162,7 @@ async def test_no_van_waits_all_night_when_power_is_short():
 # The load spike and the safety layer
 # ---------------------------------------------------------------------------
 
+@pytest.mark.night
 async def test_load_spike_night_is_over_the_limit_only_during_the_spike():
     night = await run_scenario_night("load_spike", "equal_sharing")
     spike = night["load_spikes"][0]
@@ -190,6 +171,7 @@ async def test_load_spike_night_is_over_the_limit_only_during_the_spike():
     assert len(night["controller"].safety_actions) > 0
 
 
+@pytest.mark.night
 async def test_safety_layer_brings_the_site_back_under_the_limit_in_time():
     # A short run (19:20 to 19:45, spike at 19:30) at a slow simulation speed: one simulated
     # minute = 200 real ms. Then the computer's own processing time (a few ms) is only

@@ -17,12 +17,15 @@ The smart controller (Stage 5) will be added here as well.
 import math
 
 import settings
-from src.electrical import current_a_to_power_kw
+from src.electrical import current_a_to_power_kw, power_kw_to_current_a
 
-STRATEGY_NAMES = ["uncontrolled", "equal_sharing"]
+STRATEGY_NAMES = ["uncontrolled", "equal_sharing", "smart"]
 
 # Smallest power a van can charge with: 6 A on three phases at 230 V = 4.14 kW.
 MIN_CHARGING_POWER_KW = current_a_to_power_kw(settings.CHARGER_MIN_CURRENT_A)
+
+# Largest power a charger can really be given: 22 kW rounds down to 31.8 A = 21.94 kW.
+MAX_CHARGING_POWER_KW = current_a_to_power_kw(power_kw_to_current_a(settings.CHARGER_MAX_POWER_KW))
 
 
 def equal_sharing(charger_ids_in_queue_order, available_kw):

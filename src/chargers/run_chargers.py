@@ -40,17 +40,25 @@ def log_van_results(vans, chargers):
                          settings.TARGET_STATE_OF_CHARGE_PERCENT, status)
 
 
-async def run_all_chargers(vans, host, port, simulation_speed=settings.SIMULATED_SECONDS_PER_REAL_SECOND):
+async def run_all_chargers(vans, host, port, simulation_speed=settings.SIMULATED_SECONDS_PER_REAL_SECOND,
+                           charger_outages=()):
     """
     Run one charger per van, all at the same time.
 
-    In: list of Van, controller address and port, simulation speed.
+    In: list of Van, controller address and port, simulation speed, and the scenario's
+        charger outages (dicts with charger_id, start_time, duration_minutes).
     Out: list of SimulatedCharger, after every van has left.
     """
+    outage_by_charger = {}
+    for outage in charger_outages:
+        outage_by_charger[outage["charger_id"]] = outage
+
     # Charger CP01 gets van V01, CP02 gets V02, and so on.
     charger_tasks = []
     for number, van in enumerate(vans, start=1):
-        charger_tasks.append(run_charger(f"CP{number:02d}", van, host, port, simulation_speed))
+        charger_id = f"CP{number:02d}"
+        charger_tasks.append(run_charger(charger_id, van, host, port, simulation_speed,
+                                         outage=outage_by_charger.get(charger_id)))
 
     # gather() runs all chargers side by side and waits until every one is done.
     return await asyncio.gather(*charger_tasks)
@@ -60,7 +68,8 @@ def main():
     setup_logging()
     scenario = get_scenario(settings.SCENARIO)
     log_van_schedule(scenario)
-    chargers = asyncio.run(run_all_chargers(scenario["vans"], settings.CSMS_HOST, settings.CSMS_PORT))
+    chargers = asyncio.run(run_all_chargers(scenario["vans"], settings.CSMS_HOST, settings.CSMS_PORT,
+                                            charger_outages=scenario["charger_outages"]))
     log_van_results(scenario["vans"], chargers)
 
 

@@ -17,6 +17,7 @@ All ten chargers are started together by src/chargers/run_chargers.py.
 import asyncio
 import logging
 import uuid
+from datetime import timedelta
 
 from ocpp.routing import on
 from ocpp.v201 import ChargePoint, call, call_result
@@ -28,6 +29,7 @@ from ocpp.v201.enums import (
     ChargingRateUnitEnumType,
     ChargingStateEnumType,
     ConnectorStatusEnumType,
+    IdTokenEnumType,
     MeasurandEnumType,
     ReadingContextEnumType,
     ReasonEnumType,
@@ -35,6 +37,7 @@ from ocpp.v201.enums import (
     TriggerReasonEnumType,
 )
 from websockets.asyncio.client import connect
+from websockets.exceptions import ConnectionClosed
 
 import settings
 from src.chargers.van import charge_van
@@ -118,6 +121,12 @@ class SimulatedCharger(ChargePoint):
         # at once instead of at the end of its one minute step. A real charger
         # follows a new limit within seconds.
         self.new_limit_received = asyncio.Event()
+
+        # Connection to the controller. While offline the charger keeps charging
+        # with its last limit and keeps its TransactionEvents in a queue.
+        self.is_online = True
+        self.offline_queue = []
+        self.listener_task = None
         self.energy_meter_wh = 0.0
 
         # The van that is plugged in, and its battery level.
@@ -166,12 +175,20 @@ class SimulatedCharger(ChargePoint):
         knows the link is alive. Each answer also keeps our clock in step.
         """
         while True:
-            response = await self.call(call.Heartbeat())
-            self.clock.set_time_from_iso(response.current_time)
+            # No connection, no heartbeat.
+            if self.is_online:
+                try:
+                    response = await self.call(call.Heartbeat())
+                    self.clock.set_time_from_iso(response.current_time)
+                except ConnectionClosed:
+                    pass
             await asyncio.sleep(interval_s)
 
     async def send_status(self, connector_status):
         """Tell the controller if the connector is free (Available) or has a van (Occupied)."""
+        # While offline the status cannot be sent; the charger reports it again when it reconnects.
+        if not self.is_online:
+            return
         await self.call(call.StatusNotification(
             timestamp=self.clock.now().isoformat(),
             connector_status=connector_status,
@@ -187,15 +204,18 @@ class SimulatedCharger(ChargePoint):
         TransactionEvent messages. MeterValues is for readings outside a session,
         like this one.
         """
+        if not self.is_online:
+            return
         reading = build_meter_value(self.clock.now(), 0.0, self.energy_meter_wh, ReadingContextEnumType.sample_periodic)
         await self.call(call.MeterValues(evse_id=EVSE_ID, meter_value=[reading]))
 
-    async def send_transaction_event(self, event_type, trigger_reason, context, stopped_reason=None):
+    async def send_transaction_event(self, event_type, trigger_reason, context, stopped_reason=None, id_token=None):
         """
         Send one TransactionEvent (Started, Updated or Ended) with a meter reading.
+        While offline, keep it in a queue instead and send it after reconnecting.
 
-        In: OCPP event type, why it was sent, reading context,
-            and for Ended only, why the session stopped.
+        In: OCPP event type, why it was sent, reading context, for Ended only why
+            the session stopped, and for Started the van's card (IdTokenType dict).
         """
         now = self.clock.now()
         transaction_info = {"transaction_id": self.transaction_id, "charging_state": self.charging_state()}
@@ -204,7 +224,7 @@ class SimulatedCharger(ChargePoint):
 
         reading = build_meter_value(now, self.charge_power_kw, self.energy_meter_wh, context,
                                     self.state_of_charge_percent)
-        await self.call(call.TransactionEvent(
+        request = call.TransactionEvent(
             event_type=event_type,
             timestamp=now.isoformat(),
             trigger_reason=trigger_reason,
@@ -212,9 +232,21 @@ class SimulatedCharger(ChargePoint):
             transaction_info=transaction_info,
             meter_value=[reading],
             evse={"id": EVSE_ID, "connector_id": CONNECTOR_ID},
-        ))
+            id_token=id_token,
+            # OCPP 2.0.1: events that happened while the connection was down are marked offline.
+            offline=True if not self.is_online else None,
+        )
         self.seq_no += 1
         self.last_meter_report_time = now
+
+        if self.is_online:
+            try:
+                await self.call(request)
+                return
+            except ConnectionClosed:
+                # The connection was lost just now: keep the event for later.
+                pass
+        self.offline_queue.append(request)
 
     def charging_state(self):
         """
@@ -267,12 +299,15 @@ class SimulatedCharger(ChargePoint):
                          self.clock.now().strftime("%H:%M"), van.van_id, self.state_of_charge_percent)
         await self.send_status(ConnectorStatusEnumType.occupied)
 
-        # The depot vans charge without an RFID card, so the session starts
-        # as soon as the cable is plugged in.
+        # The session starts as soon as the cable is plugged in. The van's RFID card
+        # (kept in the van) tells the controller which van this is, so it can look up
+        # the van's departure time in the fleet schedule. A real card would send its
+        # chip number; here it is simply the van id, to keep the logs readable.
         await self.send_transaction_event(
             TransactionEventEnumType.started,
             TriggerReasonEnumType.cable_plugged_in,
             ReadingContextEnumType.transaction_begin,
+            id_token={"id_token": van.van_id, "type": IdTokenEnumType.iso14443},
         )
 
     async def charge_until(self, departure_time):
@@ -442,36 +477,111 @@ class SimulatedCharger(ChargePoint):
         return current_a_to_power_kw(limit_a)
 
 
-async def run_charger(charger_id, van, host, port, simulation_speed=settings.SIMULATED_SECONDS_PER_REAL_SECOND):
+    # -----------------------------------------------------------------------
+    # The connection to the controller: listening, losing it, getting it back
+    # -----------------------------------------------------------------------
+
+    def start_listening(self):
+        """Start a background task that receives the controller's messages until the connection closes."""
+        self.listener_task = asyncio.create_task(self.listen())
+
+    async def listen(self):
+        """Receive and answer the controller's messages. Ends quietly when the connection closes."""
+        try:
+            await self.start()
+        except ConnectionClosed:
+            pass
+
+    async def simulate_outage(self, address, start_time, duration_minutes):
+        """
+        Lose the connection to the controller at start_time and get it back later.
+        The van keeps charging with the last limit the whole time.
+
+        In: controller address, outage start (simulated time), length [simulated minutes].
+        """
+        await self.wait_until(start_time)
+        self.events.info("%s connection to the controller lost", self.clock.now().strftime("%H:%M"))
+        # The ocpp library sends one request at a time and holds _call_lock until
+        # the answer arrives. Taking the lock first means no answer is lost halfway.
+        async with self._call_lock:
+            self.is_online = False
+            await self._connection.close()
+
+        await self.wait_until(start_time + timedelta(minutes=duration_minutes))
+        await self.reconnect(address)
+
+    async def reconnect(self, address):
+        """
+        Open a new connection, report the connector status, and send the queued events.
+
+        A reconnect is not a reboot, so there is no BootNotification: the charger and its
+        running transaction just carry on.
+        """
+        websocket = await connect(address, subprotocols=[settings.OCPP_SUBPROTOCOL])
+        # The ocpp library's ChargePoint keeps its connection in _connection. A reconnect
+        # gives it the new one; everything else (queues, ids) stays as it was.
+        self._connection = websocket
+        self.start_listening()
+        self.events.info("%s connection back, sending %d queued events",
+                         self.clock.now().strftime("%H:%M"), len(self.offline_queue))
+
+        if self.van is not None:
+            await self.call(call.StatusNotification(timestamp=self.clock.now().isoformat(),
+                                                    connector_status=ConnectorStatusEnumType.occupied,
+                                                    evse_id=EVSE_ID, connector_id=CONNECTOR_ID))
+        # Send the queue in order. Events that happen while we are sending are
+        # added to the end of the queue and sent in the same loop.
+        while self.offline_queue:
+            await self.call(self.offline_queue.pop(0))
+        self.is_online = True
+
+
+async def run_charger(charger_id, van, host, port, simulation_speed=settings.SIMULATED_SECONDS_PER_REAL_SECOND,
+                      outage=None):
     """
     Connect one charger to the controller and look after one van visit.
 
     In: charger name, the van (or None for a charger that only connects),
-        controller address and port, simulation speed.
+        controller address and port, simulation speed, and optionally an outage
+        (dict with start_time and duration_minutes) during which the connection is lost.
     Out: the SimulatedCharger object, so its final state can be checked.
     """
     # The charger name is part of the address. This is how the controller
     # knows which charger is on the other end of the connection.
     address = f"ws://{host}:{port}/{charger_id}"
-    async with connect(address, subprotocols=[settings.OCPP_SUBPROTOCOL]) as websocket:
-        # The start time does not matter much: boot() sets the clock to the controller's time.
-        clock = SimulationClock(settings.SIMULATION_START_TIME, simulation_speed)
-        charger = SimulatedCharger(charger_id, websocket, clock)
+    websocket = await connect(address, subprotocols=[settings.OCPP_SUBPROTOCOL])
 
-        # Task 1: keep listening for messages from the controller (like SetChargingProfile).
-        # It runs in the background while the van visit below goes on.
-        listener_task = asyncio.create_task(charger.start())
+    # The start time does not matter much: boot() sets the clock to the controller's time.
+    clock = SimulationClock(settings.SIMULATION_START_TIME, simulation_speed)
+    charger = SimulatedCharger(charger_id, websocket, clock)
 
-        heartbeat_interval_s = await charger.boot()
-        # Task 2: heartbeats in the background, also at the same time.
-        heartbeat_task = asyncio.create_task(charger.heartbeat_loop(heartbeat_interval_s))
+    # Task 1: keep listening for messages from the controller (like SetChargingProfile).
+    # It runs in the background while the van visit below goes on.
+    charger.start_listening()
 
-        await charger.send_status(ConnectorStatusEnumType.available)
-        await charger.send_idle_meter_values()
-        if van is not None:
-            await charger.run_van_visit(van)
+    heartbeat_interval_s = await charger.boot()
+    # Task 2: heartbeats in the background, also at the same time.
+    heartbeat_task = asyncio.create_task(charger.heartbeat_loop(heartbeat_interval_s))
 
-        # The visit is over: stop the background tasks before the connection closes.
-        heartbeat_task.cancel()
-        listener_task.cancel()
+    # Task 3 (only in the charger failure scenario): lose the connection for a while.
+    outage_task = None
+    if outage is not None:
+        outage_task = asyncio.create_task(
+            charger.simulate_outage(address, outage["start_time"], outage["duration_minutes"]))
+
+    await charger.send_status(ConnectorStatusEnumType.available)
+    await charger.send_idle_meter_values()
+    if van is not None:
+        await charger.run_van_visit(van)
+
+    # The visit is over: stop the background tasks and close the connection.
+    if outage_task is not None:
+        # An error inside a background task is silent unless someone looks at it.
+        # Look, and stop with that error instead of carrying on as if all was fine.
+        if outage_task.done() and outage_task.exception() is not None:
+            raise outage_task.exception()
+        outage_task.cancel()
+    heartbeat_task.cancel()
+    charger.listener_task.cancel()
+    await charger._connection.close()
     return charger

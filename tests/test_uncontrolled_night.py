@@ -14,17 +14,20 @@ from src.results import peak_site_power
 from tests.conftest import run_scenario_night
 
 
+@pytest.mark.night
 async def test_uncontrolled_charging_goes_over_the_site_limit():
     night = await run_scenario_night("normal_evening", "uncontrolled")
     peak_kw, _ = peak_site_power(night["true_site_log"])
     assert peak_kw > settings.SITE_LIMIT_KW
 
 
+@pytest.mark.night
 async def test_uncontrolled_sends_no_limits():
     night = await run_scenario_night("normal_evening", "uncontrolled")
     assert night["controller"].sent_limits == []
 
 
+@pytest.mark.night
 async def test_building_load_comes_from_the_meter():
     night = await run_scenario_night("normal_evening", "uncontrolled")
     site_log = night["controller"].site_log
@@ -34,6 +37,7 @@ async def test_building_load_comes_from_the_meter():
     assert len(matching) / len(site_log) > 0.9
 
 
+@pytest.mark.night
 async def test_state_of_charge_rises_with_the_energy_delivered():
     night = await run_scenario_night("normal_evening", "uncontrolled")
     for charger, van in zip(night["chargers"], night["vans"]):

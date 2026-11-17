@@ -80,7 +80,7 @@ class SimulatedMeter:
                                                       CLOCK_SYNC_UNIX_S, 2)
         unix_s = registers_to_uint32(registers)
         if unix_s != 0 and unix_s != self.last_clock_sync_unix_s:
-            sync_time = datetime.fromtimestamp(unix_s, tz=settings.SIMULATION_START_TIME.tzinfo)
+            sync_time = datetime.fromtimestamp(unix_s, tz=settings.TIMEZONE)
             self.clock.set_time(sync_time)
             self.last_clock_sync_unix_s = unix_s
 
@@ -113,9 +113,10 @@ class SimulatedMeter:
 
 async def run_meter():
     """Start the meter server and keep its registers up to date. Runs forever."""
-    clock = SimulationClock(settings.SIMULATION_START_TIME, settings.SIMULATED_SECONDS_PER_REAL_SECOND)
-    server, port = await start_meter_server(settings.METER_HOST, settings.METER_PORT)
     scenario = get_scenario(settings.SCENARIO)
+    # Until the controller writes its time into the clock registers, the meter starts at the scenario's start.
+    clock = SimulationClock(scenario["start_time"], settings.SIMULATED_SECONDS_PER_REAL_SECOND)
+    server, port = await start_meter_server(settings.METER_HOST, settings.METER_PORT)
     logging.getLogger("METER").info("Modbus TCP meter listening on %s:%s, unit id %s, scenario %s",
                                     settings.METER_HOST, port, settings.METER_DEVICE_ID, scenario["name"])
     await SimulatedMeter(server, clock, scenario["load_spikes"]).run()
