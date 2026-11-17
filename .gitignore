@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Secrets (InfluxDB token, passwords). Only .env.example is committed.
+.env

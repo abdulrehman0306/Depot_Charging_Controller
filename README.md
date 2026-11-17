@@ -6,17 +6,20 @@ Software that charges a fleet of electric delivery vans on time, without going o
 
 This project is being built in stages. This README will be completed at the end, with results that come from real runs of the code.
 
-## Current state: Stage 5, the smart controller
+## Current state: Stage 6, storage, dashboard and API
 
 ### Programs
 
 - `src/meter/modbus_meter.py`: a simulated building energy meter, a Modbus TCP server (pymodbus) on port 5020, unit id 1. It plays the building load of the chosen scenario.
-- `src/controller/run_controller.py`: starts the central controller (CSMS).
+- `src/controller/run_controller.py`: starts the central controller (CSMS) and the REST API.
   - `central_system.py`: the OCPP 2.0.1 side. It accepts the chargers, tracks what each one reports, and sends limits with SetChargingProfile.
   - `site_control.py`: the control loop and the safety layer (see below).
   - `strategies.py`: equal sharing.
   - `smart_planner.py`: the smart controller's optimisation model (Pyomo, solved by HiGHS) and its fallback rule.
   - `meter_reader.py`: the Modbus TCP client for the meter.
+  - `storage.py`: writes every control cycle's measurements to InfluxDB.
+- `src/api/app.py`: the REST API (FastAPI), served by the controller program.
+- `grafana/`: the Grafana dashboard (`dashboards/depot_charging.json`) and the provisioning files that load it and the InfluxDB data source automatically when Grafana starts.
 - `src/chargers/run_chargers.py`: starts one simulated 22 kW wallbox per van of the chosen scenario (`simulated_charger.py`), and prints each van's state of charge when it leaves.
 
 ### Data
@@ -141,6 +144,51 @@ The energy cost is the day-ahead price only. Grid fees, taxes and levies are the
 
 In the live demo of the January night (smart, simulation speed 600) no van charged before midnight, while prices were high (up to 224 EUR/MWh at 17:30). From 00:00 to 05:00 the vans charged with the full 120 kW, in the cheapest hours of the night (down to 82 EUR/MWh). All ten vans left with 92.0 to 95.0 %, the site peaked at 135.0 kW, and none of the 78 plans needed the fallback rule.
 
+## Storage, dashboard and API
+
+### InfluxDB
+
+Every control cycle (one simulated minute) the controller writes three measurements to InfluxDB:
+
+| Measurement | Tags | Fields |
+|---|---|---|
+| `site` | run | building_kw, charging_kw, site_kw, estimated_site_kw, site_limit_kw, target_kw |
+| `charger` | run, charger_id, van_id | power_kw, allowed_power_kw, state_of_charge_percent, connected |
+| `price` | run | price_eur_per_mwh |
+
+The time of each point is the simulated time, so the dashboard shows the night's clock times and prices. Each run of the controller gets its own `run` tag (start time, strategy, scenario), because two runs of the same night have the same simulated times.
+
+Writing never holds up the control loop: each write is a background task. If InfluxDB is down, the measurements are lost and a warning is printed (at the first failure and then every 60th), but charging control carries on. This was checked by running a whole night with InfluxDB switched off: 841 writes failed, and the night ran normally.
+
+### Grafana dashboard
+
+`grafana/dashboards/depot_charging.json` has five panels: site power against the grid limit and the planning target, building load, day-ahead price, charging power per charger, and state of charge per van. A drop-down at the top chooses the run; the newest run is shown first. The default time range is the normal night (14 to 15 January 2026); for the `negative_prices` scenario choose 4 to 5 October 2025.
+
+Grafana loads the dashboard and the InfluxDB data source by itself when it starts, from `grafana/provisioning/`. The data source file holds no secrets: the token is filled in from the environment.
+
+### REST API
+
+The controller program also serves a REST API (FastAPI) on http://127.0.0.1:8000. FastAPI makes an interactive page with all endpoints at http://127.0.0.1:8000/docs.
+
+| Endpoint | What it does |
+|---|---|
+| `GET /status` | the site now: simulated time, strategy, limit, planning target, building, charging and site power |
+| `GET /chargers` | every charger: connected or not, van, power, allowed power, state of charge |
+| `GET /vans` | every plugged-in van: charger, state of charge, departure time, the smart controller's planned shortfall |
+| `PUT /site-limit` | change the grid limit, e.g. `{"site_limit_kw": 120}`, between 20 and 400 kW |
+
+A new limit is used from the next control cycle. If the site is then above the new planning target (limit minus 15 kW), the safety layer cuts charging at once. In a live run (equal sharing, normal night, simulation speed 600) the limit was lowered from 150 to 100 kW at 19:36 while 6 vans were charging and the site drew 134.6 kW. The controller's next cycle, at 19:37:36, measured 34.6 kW over the new limit and cut charging; at 19:38:41 the site was back under 100 kW, and at 19:45 it drew 84.8 kW, just under the new 85 kW target. A request for 5 kW was refused with HTTP 422 and changed nothing. Time over the limit is always counted against the limit in force at that moment.
+
+### Secrets
+
+The InfluxDB token and the passwords are kept out of git. They live in a file called `.env`, which is listed in `.gitignore`. The repository only has `.env.example` with placeholder values. Before the first start:
+
+```
+copy .env.example .env
+```
+
+and replace every `change-me` value in `.env` with your own (for the token, a long random text). `settings.py` reads `.env` when the programs start. Without a token, the controller runs without storing measurements.
+
 ## How to run
 
 Set up once (Windows, from the repository folder):
@@ -151,7 +199,7 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-Start three programs in three terminals, in this order:
+Create `.env` as described under "Secrets". InfluxDB and Grafana are started with Docker (Stage 7). Then start three programs in three terminals, in this order:
 
 ```
 python -m src.meter.modbus_meter

@@ -4,6 +4,9 @@ so the comparison between strategies is fair.
 
 A site log is a list of samples, oldest first. Each sample is a dict with at least:
     {"time": datetime, "building_kw": float, "charging_kw": float, "site_kw": float}
+A sample may also hold "site_limit_kw", the limit in force at that moment (it can be
+changed through the API during a run). Then that limit is used for the sample instead
+of the one passed to the scoring function.
 
 Two kinds of site log are used:
 - measured: what the controller saw (meter reading + charger reports). This is
@@ -21,6 +24,15 @@ from src.prices import price_at
 
 # Power values within this much of the limit count as "at the limit", not over it.
 POWER_TOLERANCE_KW = 0.01
+
+
+def is_over_limit(sample, site_limit_kw):
+    """
+    In: one site log sample, the site limit [kW] to use if the sample does not hold its own.
+    Out: True if the site power was over the limit in force at that moment.
+    """
+    limit_kw = sample.get("site_limit_kw", site_limit_kw)
+    return sample["site_kw"] > limit_kw + POWER_TOLERANCE_KW
 
 
 def peak_site_power(site_log):
@@ -49,7 +61,7 @@ def minutes_over_limit(site_log, site_limit_kw):
     """
     total_minutes = 0.0
     for sample, next_sample in zip(site_log, site_log[1:]):
-        if sample["site_kw"] > site_limit_kw + POWER_TOLERANCE_KW:
+        if is_over_limit(sample, site_limit_kw):
             total_minutes += (next_sample["time"] - sample["time"]).total_seconds() / 60
     return total_minutes
 
@@ -65,7 +77,7 @@ def over_limit_episodes(site_log, site_limit_kw):
     episodes = []
     episode_start = None
     for sample in site_log:
-        is_over = sample["site_kw"] > site_limit_kw + POWER_TOLERANCE_KW
+        is_over = is_over_limit(sample, site_limit_kw)
         if is_over and episode_start is None:
             episode_start = sample["time"]
         elif not is_over and episode_start is not None:
@@ -90,7 +102,7 @@ def spike_reaction_minutes(site_log, spike, site_limit_kw):
     for sample in site_log:
         if sample["time"] < spike.start_time:
             continue
-        is_over = sample["site_kw"] > site_limit_kw + POWER_TOLERANCE_KW
+        is_over = is_over_limit(sample, site_limit_kw)
         if is_over:
             over_seen = True
         elif over_seen:

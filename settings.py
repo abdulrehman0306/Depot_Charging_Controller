@@ -11,6 +11,13 @@ from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from dotenv import load_dotenv
+
+# Read the secrets (InfluxDB token, passwords) from the .env file next to this one,
+# if it exists. Values already set in the environment (for example by Docker) win.
+# .env is in .gitignore; .env.example shows which values it needs.
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
 # ---------------------------------------------------------------------------
 # Chargers
 # ---------------------------------------------------------------------------
@@ -196,3 +203,22 @@ METER_VALUE_INTERVAL_MINUTES = 5
 # Print every raw OCPP message. Useful with one charger; with ten it is a flood,
 # so it is off unless you set PRINT_OCPP_MESSAGES=1.
 PRINT_OCPP_MESSAGES = os.environ.get("PRINT_OCPP_MESSAGES", "0") == "1"
+
+# ---------------------------------------------------------------------------
+# Storage (InfluxDB) and the REST API
+# ---------------------------------------------------------------------------
+# Connection to InfluxDB. The token is a secret: it comes from .env, never from this file.
+# Without a token the controller runs without storing measurements.
+INFLUXDB_URL = os.environ.get("INFLUXDB_URL", "http://localhost:8086")
+INFLUXDB_ORG = os.environ.get("INFLUXDB_ORG", "depot")
+INFLUXDB_BUCKET = os.environ.get("INFLUXDB_BUCKET", "depot")
+INFLUXDB_TOKEN = os.environ.get("INFLUXDB_TOKEN", "")
+
+# The REST API (FastAPI) is served by the controller program on this address.
+API_HOST = os.environ.get("API_HOST", "127.0.0.1")
+API_PORT = int(os.environ.get("API_PORT", "8000"))
+
+# Allowed range when the site limit is changed through the API [kW]. The lower end
+# must stay above the safety margin, or there would be nothing left to plan with.
+SITE_LIMIT_MIN_KW = 20.0
+SITE_LIMIT_MAX_KW = 400.0

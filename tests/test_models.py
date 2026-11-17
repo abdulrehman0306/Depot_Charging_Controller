@@ -180,3 +180,12 @@ def test_charging_cost_splits_a_step_at_the_quarter_hour():
     power_log = [{"start": ten + timedelta(minutes=10), "end": ten + timedelta(minutes=20), "power_kw": 12.0}]
     # 1 kWh x 0.100 EUR/kWh + 1 kWh x 0.200 EUR/kWh = 0.30 EUR
     assert charging_cost_eur([power_log], prices) == pytest.approx(0.30)
+
+
+def test_minutes_over_limit_uses_the_limit_in_force_at_each_moment():
+    # 130 kW all the time. The limit is 150 kW, then lowered to 100 kW (through the API) for minutes 2 and 3.
+    site_log = make_site_log([130, 130, 130, 130, 130, 130])
+    for minute in (2, 3):
+        site_log[minute]["site_limit_kw"] = 100.0
+    assert minutes_over_limit(site_log, 150) == 2.0
+    assert over_limit_episodes(site_log, 150) == [(START + timedelta(minutes=2), START + timedelta(minutes=4))]

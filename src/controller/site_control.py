@@ -36,6 +36,7 @@ import settings
 from src.controller.central_system import send_power_limit
 from src.controller.meter_reader import MeterReadError, read_meter, write_meter_clock
 from src.controller.smart_planner import plan_charging, plan_steps, warm_up_solver
+from src.controller.storage import charger_points, price_point, site_point
 from src.controller.strategies import equal_sharing
 from src.electrical import charging_current_limit_a
 from src.meter.building_load import BUILDING_LOAD_BY_HOUR_KW
@@ -106,13 +107,15 @@ class SiteController:
 
     def __init__(self, chargers_by_id, clock, meter_client, strategy_name,
                  site_limit_kw=settings.SITE_LIMIT_KW, safety_margin_kw=settings.SAFETY_MARGIN_KW,
-                 scenario_name=None, fleet_schedule=None, prices=None):
+                 scenario_name=None, fleet_schedule=None, prices=None, storage=None, run_name=""):
         """
         In: dict of all chargers by id, simulated clock, Modbus client for the meter,
             strategy name ("uncontrolled", "equal_sharing" or "smart"), site limit [kW],
             safety margin [kW], scenario name (only for the report), and for the smart
             controller: the fleet schedule (van id -> departure time) and the day-ahead
-            prices (pandas Series, see src/prices.py).
+            prices (pandas Series, see src/prices.py). Optionally a MeasurementStore
+            (src/controller/storage.py) to write every cycle's measurements to InfluxDB,
+            and the name of this run, used to tell runs apart in the database.
         """
         self.chargers_by_id = chargers_by_id
         self.clock = clock
@@ -126,6 +129,8 @@ class SiteController:
         # knows: when each van must leave. The van id comes from its RFID card over OCPP.
         self.fleet_schedule = fleet_schedule or {}
         self.prices = prices
+        self.storage = storage
+        self.run_name = run_name
         # Smart controller results: the energy each van is expected to be missing at departure.
         self.planned_shortfall_kwh = {}
         # Every regular plan's forecast: dicts with time and shortfall_kwh (van id -> kWh).
@@ -189,6 +194,8 @@ class SiteController:
         now = self.clock.now()
         self.building_kw = await read_building_load_kw(self.meter_client, now, self.building_kw)
         self.record_sample(now)
+        if self.storage is not None:
+            self.store_measurements(now)
 
         # Uncontrolled means no software: no plans and no safety layer.
         if self.strategy_name != "uncontrolled":
@@ -436,6 +443,17 @@ class SiteController:
     # Logging and the end-of-night report
     # -----------------------------------------------------------------------
 
+    def store_measurements(self, now):
+        """Hand this cycle's site, charger and price values to the store (written in the background)."""
+        points = [site_point(self.site_log[-1], self.run_name, self.site_limit_kw, self.target_kw())]
+        points += charger_points(self.chargers_by_id, self.run_name, now)
+        if self.prices is not None:
+            try:
+                points.append(price_point(price_at(self.prices, now), self.run_name, now))
+            except KeyError:
+                pass
+        self.storage.write_in_background(points)
+
     def record_sample(self, now):
         """Store the measured site power and print a line each quarter hour or while over the limit."""
         charging_kw = sum(charger.charge_power_kw for charger in self.chargers_by_id.values())
@@ -445,6 +463,8 @@ class SiteController:
             "charging_kw": charging_kw,
             "site_kw": self.building_kw + charging_kw,
             "estimated_site_kw": self.estimated_site_kw(),
+            # The limit in force now. It can be changed through the API during the run.
+            "site_limit_kw": self.site_limit_kw,
         }
         self.site_log.append(sample)
 
@@ -472,10 +492,14 @@ class SiteController:
     def log_night_summary(self):
         """Print the peak site power, time over the limit, safety actions and spike reaction times."""
         peak_kw, peak_time = peak_site_power(self.site_log)
-        self.events.info("summary: strategy %s, peak site power %.1f kW at %s, %.0f minutes over the %.0f kW limit, "
-                         "%d safety actions", self.strategy_name, peak_kw, peak_time.strftime("%H:%M"),
-                         minutes_over_limit(self.site_log, self.site_limit_kw), self.site_limit_kw,
-                         len(self.safety_actions))
+        # The limit may have been changed through the API, so each minute is checked against
+        # the limit in force at that moment.
+        limits_kw = sorted({sample.get("site_limit_kw", self.site_limit_kw) for sample in self.site_log})
+        limits_text = " / ".join(f"{limit_kw:.0f}" for limit_kw in limits_kw)
+        self.events.info("summary: strategy %s, peak site power %.1f kW at %s, %.0f minutes over the limit in force "
+                         "(limits used: %s kW), %d safety actions", self.strategy_name, peak_kw,
+                         peak_time.strftime("%H:%M"), minutes_over_limit(self.site_log, self.site_limit_kw),
+                         limits_text, len(self.safety_actions))
         for start, end in over_limit_episodes(self.site_log, self.site_limit_kw):
             end_text = end.strftime("%H:%M:%S") if end is not None else "end of log"
             self.events.info("summary: measured over the limit from %s to %s", start.strftime("%H:%M:%S"), end_text)

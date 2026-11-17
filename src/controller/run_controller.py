@@ -1,6 +1,7 @@
 """
-Start the central controller: the OCPP server for the chargers and the
-control loop that reads the meter and decides the power limits.
+Start the central controller: the OCPP server for the chargers, the control loop
+that reads the meter and decides the power limits, the REST API, and (if an
+InfluxDB token is set in .env) the writing of measurements to InfluxDB.
 
 The controller owns the simulated clock. Chargers set their clocks from it
 over OCPP, and the meter through its clock registers.
@@ -11,11 +12,16 @@ Start the meter first, then run:
 
 import asyncio
 import logging
+from datetime import datetime
+
+import uvicorn
 
 import settings
+from src.api.app import create_app
 from src.controller.central_system import start_csms_server
 from src.controller.meter_reader import create_meter_client
 from src.controller.site_control import SiteController
+from src.controller.storage import MeasurementStore
 from src.log_setup import setup_logging
 from src.prices import load_prices
 from src.scenarios import get_scenario
@@ -61,11 +67,38 @@ async def run_controller():
                 scenario["night_date"], settings.SIMULATED_SECONDS_PER_REAL_SECOND)
     events.info("reading building meter at %s:%s over Modbus TCP", settings.METER_HOST, settings.METER_PORT)
 
+    storage = create_storage()
+    run_name = f"{datetime.now():%Y-%m-%d %H:%M:%S} {settings.STRATEGY} {scenario['name']}"
     controller = SiteController(chargers_by_id, clock, meter_client, settings.STRATEGY,
                                 scenario_name=scenario["name"],
                                 fleet_schedule=fleet_schedule_from_vans(scenario["vans"]),
-                                prices=load_prices())
-    await controller.run()
+                                prices=load_prices(), storage=storage, run_name=run_name)
+
+    # The REST API runs in the same program, on the same event loop, so it can read the
+    # controller's state directly. uvicorn is the web server that runs the FastAPI app.
+    api_server = uvicorn.Server(uvicorn.Config(create_app(controller), host=settings.API_HOST,
+                                               port=settings.API_PORT, log_level="warning"))
+    events.info("REST API on http://%s:%s (interactive page: /docs)", settings.API_HOST, settings.API_PORT)
+
+    # Control loop and API side by side, forever.
+    try:
+        await asyncio.gather(controller.run(), api_server.serve())
+    finally:
+        if storage is not None:
+            await storage.close()
+
+
+def create_storage():
+    """
+    Out: a MeasurementStore for InfluxDB, or None if no token is set (then nothing is stored).
+    """
+    events = logging.getLogger("STORAGE")
+    if not settings.INFLUXDB_TOKEN:
+        events.warning("no INFLUXDB_TOKEN in .env: measurements are not stored")
+        return None
+    events.info("writing measurements to InfluxDB at %s, bucket %s", settings.INFLUXDB_URL, settings.INFLUXDB_BUCKET)
+    return MeasurementStore(settings.INFLUXDB_URL, settings.INFLUXDB_TOKEN, settings.INFLUXDB_ORG,
+                            settings.INFLUXDB_BUCKET)
 
 
 def main():

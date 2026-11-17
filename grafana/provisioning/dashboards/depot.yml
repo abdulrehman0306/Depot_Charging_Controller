@@ -1,0 +1,10 @@
+# Grafana reads this file when it starts and loads every dashboard JSON file
+# from the folder below. In Docker, grafana/dashboards is mounted there.
+apiVersion: 1
+
+providers:
+  - name: depot
+    type: file
+    disableDeletion: true
+    options:
+      path: /var/lib/grafana/dashboards

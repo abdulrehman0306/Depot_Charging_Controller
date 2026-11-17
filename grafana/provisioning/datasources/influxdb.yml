@@ -1,0 +1,18 @@
+# Grafana reads this file when it starts and adds InfluxDB as a data source.
+# The ${...} values are filled in from environment variables (set from .env),
+# so the token is never written into a file in git.
+apiVersion: 1
+
+datasources:
+  - name: InfluxDB
+    uid: depot-influxdb
+    type: influxdb
+    access: proxy
+    url: ${INFLUXDB_URL}
+    isDefault: true
+    jsonData:
+      version: Flux
+      organization: ${INFLUXDB_ORG}
+      defaultBucket: ${INFLUXDB_BUCKET}
+    secureJsonData:
+      token: ${INFLUXDB_TOKEN}
