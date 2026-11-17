@@ -2,7 +2,7 @@
 Real German day-ahead prices from SMARD.de (Bundesnetzagentur), quarter hours, EUR/MWh.
 
 The download and loading code is taken from my earlier project
-battery-revenue-study (src/download_data.py and src/load_data.py), cut down to
+Battery_Revenue_Study (src/download_data.py and src/load_data.py), cut down to
 the price series and to the nights this project uses:
 https://github.com/abdulrehman0306/Battery_Revenue_Study
 
@@ -33,7 +33,7 @@ NUMBER_OF_ATTEMPTS = 3
 
 
 # ---------------------------------------------------------------------------
-# Download (from battery-revenue-study/src/download_data.py)
+# Download (from Battery_Revenue_Study/src/download_data.py)
 # ---------------------------------------------------------------------------
 
 def is_valid_smard_file(content):
@@ -136,7 +136,7 @@ def download_prices_for_night(night_date):
 
 
 # ---------------------------------------------------------------------------
-# Loading (from battery-revenue-study/src/load_data.py)
+# Loading (from Battery_Revenue_Study/src/load_data.py)
 # ---------------------------------------------------------------------------
 
 def unix_ms_to_berlin(timestamps_ms):
