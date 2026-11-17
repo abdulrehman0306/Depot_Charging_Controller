@@ -1,6 +1,6 @@
 """
 The smart controller: the optimisation planner on small hand-made cases, the fallback
-rule, and whole nights compared with equal sharing on cost.
+rule, whole nights compared with equal sharing on cost, and the shortfall forecast.
 """
 
 from datetime import timedelta
@@ -12,8 +12,9 @@ from src.controller import smart_planner
 from src.controller.smart_planner import plan_charging, plan_steps
 from src.controller.strategies import MAX_CHARGING_POWER_KW, MIN_CHARGING_POWER_KW
 from src.prices import price_at
-from src.results import charging_cost_eur, van_results
+from src.results import charging_cost_eur
 from tests.conftest import PRICES, run_scenario_night
+from tests.stepped_night import run_stepped_smart_night
 
 NOW = settings.SIMULATION_START_TIME
 
@@ -143,23 +144,50 @@ async def test_smart_charges_in_the_negative_price_quarter_hours():
     assert night_cost_eur(smart) < 0
 
 
-@pytest.mark.night
-async def test_smart_reports_in_advance_which_vans_will_be_short():
-    night = await run_scenario_night("impossible", "smart")
-    visits = []
-    for charger in night["chargers"]:
-        visits.extend(charger.completed_visits)
-    actual_shortfall_kwh = {result["van_id"]: result["shortfall_kwh"]
-                            for result in van_results(night["vans"], visits)}
+# The forecast is tested on a stepped clock (tests/stepped_night.py), so it gives the same
+# result on every run. Each plan's limits reach the chargers after a delay from a fixed list.
+# The lists copy what was measured in the full nights at test speed: usually about 2 simulated
+# minutes, with single slow plans of 6 to 16 minutes.
+MEASURED_LIKE_DELAYS_MINUTES = [2, 1, 2, 6, 2, 3, 2, 10]
+HARSH_DELAYS_MINUTES = [2, 2, 16, 2, 4, 2, 10, 2]
 
+
+def shortfall_forecast_and_result(night, forecast_hour):
+    """
+    In: a finished stepped night, the hour of the forecast to look at.
+    Out: (forecast shortfall per van [kWh], real shortfall per van [kWh]).
+    """
+    forecast = [entry for entry in night["controller"].shortfall_forecasts
+                if entry["time"].hour == forecast_hour][0]["shortfall_kwh"]
+    real = {}
+    for van_id, departure_percent in night["departure_state_of_charge_percent"].items():
+        missing_percent = max(0.0, settings.TARGET_STATE_OF_CHARGE_PERCENT - departure_percent)
+        real[van_id] = missing_percent / 100 * settings.VAN_BATTERY_USABLE_KWH
+    return forecast, real
+
+
+async def test_stepped_night_gives_the_same_result_every_time():
+    first = await run_stepped_smart_night("impossible", PRICES, MEASURED_LIKE_DELAYS_MINUTES)
+    second = await run_stepped_smart_night("impossible", PRICES, MEASURED_LIKE_DELAYS_MINUTES)
+    assert first["departure_state_of_charge_percent"] == second["departure_state_of_charge_percent"]
+    assert first["controller"].shortfall_forecasts == second["controller"].shortfall_forecasts
+
+
+@pytest.mark.parametrize("plan_delays_minutes", [MEASURED_LIKE_DELAYS_MINUTES, HARSH_DELAYS_MINUTES])
+async def test_smart_warns_in_advance_about_every_van_that_will_be_short(plan_delays_minutes):
+    night = await run_stepped_smart_night("impossible", PRICES, plan_delays_minutes)
     # The forecast made at 21:00, four hours before the vans leave at 01:00.
-    forecasts = night["controller"].shortfall_forecasts
-    forecast_2100 = [forecast for forecast in forecasts if forecast["time"].hour == 21][0]["shortfall_kwh"]
+    forecast, real = shortfall_forecast_and_result(night, forecast_hour=21)
 
-    # It named the right vans: every van it called short really was short, and the other way round.
-    forecast_short = {van_id for van_id, kwh in forecast_2100.items() if kwh > 0.1}
-    actually_short = {van_id for van_id, kwh in actual_shortfall_kwh.items() if kwh > 0.1}
-    assert forecast_short == actually_short
+    # What matters to a dispatcher: no missed warning. Every van that really left short
+    # was forecast as short. (A warning for a borderline van that then just made it is fine.)
+    for van_id, real_kwh in real.items():
+        if real_kwh > 0.1:
+            assert forecast[van_id] > 0.1, f"{van_id} left {real_kwh:.1f} kWh short without a warning"
 
-    # And the total it forecast is close to what was really missing (within 20 %).
-    assert sum(forecast_2100.values()) == pytest.approx(sum(actual_shortfall_kwh.values()), rel=0.2)
+    # Each van's forecast is within 3 kWh (4 % of the battery) of what really happened.
+    for van_id, real_kwh in real.items():
+        assert forecast[van_id] == pytest.approx(real_kwh, abs=3.0)
+
+    # And the total is within 20 %.
+    assert sum(forecast.values()) == pytest.approx(sum(real.values()), rel=0.2)

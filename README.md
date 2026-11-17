@@ -192,4 +192,6 @@ All tests (about 10 minutes):
 python -m pytest
 ```
 
+The smart controller's shortfall forecast is tested on a stepped clock (`tests/stepped_night.py`): the controller's own planning code and the same van battery model, but the simulated time only moves when the test moves it, one minute at a time, and each plan's limits arrive after a delay from a fixed list. So it gives the same result on every run. The test checks what matters to a dispatcher: every van that really leaves short was warned about at 21:00, four hours before; each van's forecast is within 3 kWh; the total is within 20 %.
+
 The night tests run complete nights of every scenario with the real OCPP and Modbus connections. They check the true site power, rebuilt from what every charger really drew, not only what the controller measured. Nights with equal sharing run at 3000 times real time. Nights with the smart controller run at 1000 times real time, because each plan takes the optimiser about 80 real milliseconds; at 3000 times real time that would be 4 simulated minutes, far from reality (at the normal 60 times real time it is 5 simulated seconds).
