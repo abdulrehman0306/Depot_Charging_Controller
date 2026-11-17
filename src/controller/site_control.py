@@ -59,6 +59,12 @@ async def read_building_load_kw(meter_client, sim_time, last_building_kw):
     """
     try:
         await write_meter_clock(meter_client, sim_time)
+        if last_building_kw is None:
+            # The very first cycle: the meter has only just been told our time, and
+            # follows it at its next update (within a simulated minute). Until then it
+            # still shows the load for its own clock. Do not trust this one reading;
+            # use the safe high guess instead.
+            return settings.BUILDING_LOAD_IF_METER_UNKNOWN_KW
         return (await read_meter(meter_client))["power_kw"]
     except MeterReadError as error:
         logging.getLogger("CSMS").warning("meter not readable (%s), using %s", error,

@@ -166,7 +166,14 @@ Writing never holds up the control loop: each write is a background task. If Inf
 
 Grafana loads the dashboard and the InfluxDB data source by itself when it starts, from `grafana/provisioning/`. The data source file holds no secrets: the token is filled in from the environment.
 
-Checked live (InfluxDB 2.7.11 and Grafana 11.5.2 in Docker, started from `docker-compose.yml` with the values from `.env`): InfluxDB set itself up with the `depot` bucket and accepted the token; Grafana's own health check of the provisioned data source answered "datasource is working. 3 buckets found"; the "Depot charging" dashboard was loaded from the JSON file with its 5 panels and is the home page. One smart night of the normal scenario (simulation speed 600) then stored 816 control cycles: 4,896 site values, 30,797 charger values and 816 prices, with no failed writes. The highest site power stored in InfluxDB, 135.0 kW at 01:31, is the same as the controller's own end-of-night summary.
+Checked live (InfluxDB 2.7.11 and Grafana 11.5.2 in Docker, started from `docker-compose.yml` with the values from `.env`): InfluxDB set itself up with the `depot` bucket and accepted the token; Grafana's own health check of the provisioned data source answered "datasource is working. 3 buckets found"; the "Depot charging" dashboard was loaded from the JSON file with its 5 panels and is the home page. One smart night of the normal scenario (simulation speed 600) then stored 867 control cycles, from 15:34 to 07:44: 5,202 site values, 31,741 charger values and 867 prices, with no failed writes. All five panels showed the run, and the building load panel follows the synthetic profile step by step.
+
+The dashboard showed two faults that the tests had not, both fixed:
+
+- The first run stored nothing before 16:24, although the night starts at 15:30. Reading the price files and the solver's first solve took a few real seconds, and the simulated clock was already running. Now that work happens before the clock starts.
+- The very first meter reading was wrong (15 kW instead of 35 kW). The meter follows the controller's clock only at its next update after the clock has been written, so the first reading still showed the load for the meter's own clock. The controller now uses the safe high guess (60 kW) for that one first minute, which is the 60 kW at the start of the building load panel.
+
+The dashboard also shows how the smart controller works: on this night the quarter hour prices zig-zag after midnight, and the controller charges only in the cheaper ones. The 24 quarter hours with charging cost 89.0 EUR/MWh on average, the 26 quarter hours between 18:00 and 05:00 without charging 132.2 EUR/MWh (from the first run of this check).
 
 ### REST API
 

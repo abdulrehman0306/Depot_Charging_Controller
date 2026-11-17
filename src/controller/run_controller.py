@@ -21,6 +21,7 @@ from src.api.app import create_app
 from src.controller.central_system import start_csms_server
 from src.controller.meter_reader import create_meter_client
 from src.controller.site_control import SiteController
+from src.controller.smart_planner import warm_up_solver
 from src.controller.storage import MeasurementStore
 from src.log_setup import setup_logging
 from src.prices import load_prices
@@ -55,6 +56,12 @@ def fleet_schedule_from_vans(vans):
 async def run_controller():
     """Start the server and the control loop with the values from settings.py. Runs forever."""
     scenario = get_scenario(settings.SCENARIO)
+
+    # Slow start-up work first (reading the price files, the solver's first solve), so it
+    # does not eat simulated time: the simulated clock only starts after it.
+    prices = load_prices()
+    if settings.STRATEGY == "smart":
+        warm_up_solver()
     clock = SimulationClock(scenario["start_time"], settings.SIMULATED_SECONDS_PER_REAL_SECOND)
     chargers_by_id = {}
     meter_client = create_meter_client(settings.METER_HOST, settings.METER_PORT)
@@ -72,7 +79,7 @@ async def run_controller():
     controller = SiteController(chargers_by_id, clock, meter_client, settings.STRATEGY,
                                 scenario_name=scenario["name"],
                                 fleet_schedule=fleet_schedule_from_vans(scenario["vans"]),
-                                prices=load_prices(), storage=storage, run_name=run_name)
+                                prices=prices, storage=storage, run_name=run_name)
 
     # The REST API runs in the same program, on the same event loop, so it can read the
     # controller's state directly. uvicorn is the web server that runs the FastAPI app.
