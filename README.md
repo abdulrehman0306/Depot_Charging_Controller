@@ -2,11 +2,13 @@
 
 # Depot_Charging_Controller
 
+[![tests](https://github.com/abdulrehman0306/Depot_Charging_Controller/actions/workflows/tests.yml/badge.svg)](https://github.com/abdulrehman0306/Depot_Charging_Controller/actions/workflows/tests.yml)
+
 Software that charges a fleet of electric delivery vans on time, without going over the depot's grid connection limit, and as cheaply as possible.
 
 This project is being built in stages. This README will be completed at the end, with results that come from real runs of the code.
 
-## Current state: Stage 6, storage, dashboard and API
+## Current state: Stage 7, Docker and automatic tests
 
 ### Programs
 
@@ -20,6 +22,8 @@ This project is being built in stages. This README will be completed at the end,
   - `storage.py`: writes every control cycle's measurements to InfluxDB.
 - `src/api/app.py`: the REST API (FastAPI), served by the controller program.
 - `grafana/`: the Grafana dashboard (`dashboards/depot_charging.json`) and the provisioning files that load it and the InfluxDB data source automatically when Grafana starts.
+- `Dockerfile` and `docker-compose.yml`: start the whole system with one command (see "How to run").
+- `.github/workflows/tests.yml`: GitHub Actions runs all tests on every push.
 - `src/chargers/run_chargers.py`: starts one simulated 22 kW wallbox per van of the chosen scenario (`simulated_charger.py`), and prints each van's state of charge when it leaves.
 
 ### Data
@@ -200,6 +204,45 @@ and replace every `change-me` value in `.env` with your own (for the token, a lo
 
 ## How to run
 
+### With Docker: everything with one command
+
+Needs Docker Desktop (running) and a `.env` file, created as described under "Secrets". Then, from the repository folder:
+
+```
+docker compose up -d
+```
+
+This builds the image for the Python programs (the first time takes a few minutes) and starts six containers in this order:
+
+| Container | What it is | Where to look |
+|---|---|---|
+| `influxdb` | the database | http://localhost:8086 |
+| `meter` | the simulated building meter (Modbus TCP) | |
+| `controller` | the CSMS with the control loop and the REST API | http://localhost:8000/docs |
+| `chargers` | the ten simulated chargers; stops when the last van has left | `docker compose logs chargers` |
+| `grafana` | the dashboard | http://localhost:3000 |
+
+Each one waits until the ones it needs are ready: the controller waits for the meter and InfluxDB, the chargers wait for the controller. Grafana's login is `GRAFANA_ADMIN_USER` and `GRAFANA_ADMIN_PASSWORD` from your `.env`.
+
+With the default speed a night takes about 16 minutes. For a faster run, set the speed (and if you like the scenario and strategy) for this start only, in PowerShell:
+
+```
+$env:SIM_SPEED="600"; docker compose up -d
+```
+
+or permanently in `.env` (see `.env.example`). Useful commands:
+
+```
+docker compose ps                 which containers run, and whether they are healthy
+docker compose logs -f controller follow the controller's output
+docker compose logs chargers      the vans' results at the end of the night
+docker compose down               stop and remove the containers (the data stays in the volumes)
+```
+
+Checked: one smart night of the normal scenario, all six containers, simulation speed 600. The chargers container finished with exit code 0, all ten vans left with 92.3 to 94.5 %, the site peaked at 135.0 kW with no minute over the limit, none of the 75 plans needed the fallback rule, and the night's 962 site samples reached InfluxDB. The image is 571 MB (Python 3.14.6 on Debian, all packages, the project code). `.env` is kept out of the image by `.dockerignore`; the secrets reach the containers as environment variables.
+
+### Without Docker, for development
+
 Set up once (Windows, from the repository folder):
 
 ```
@@ -208,13 +251,11 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-Create `.env` as described under "Secrets". Start InfluxDB and Grafana with Docker (Docker Desktop must be running):
+Create `.env` as described under "Secrets". For storage and the dashboard, start only InfluxDB and Grafana in Docker:
 
 ```
-docker compose up -d
+docker compose up -d influxdb grafana
 ```
-
-Grafana is then at http://localhost:3000 (log in with `GRAFANA_ADMIN_USER` and `GRAFANA_ADMIN_PASSWORD` from your `.env`), InfluxDB at http://localhost:8086.
 
 Then start three programs in three terminals, in this order:
 
@@ -245,7 +286,9 @@ python -m src.prices
 
 ## Tests
 
-Quick tests (about 10 seconds), without the whole simulated nights:
+GitHub Actions runs all tests on every push (`.github/workflows/tests.yml`): the quick tests and the whole nights in two jobs side by side, on a fresh Linux machine. The badge at the top shows the result of the last run.
+
+To run them yourself, quick tests (about 20 seconds), without the whole simulated nights:
 
 ```
 python -m pytest -m "not night"

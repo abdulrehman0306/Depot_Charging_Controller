@@ -171,7 +171,11 @@ SIMULATION_START_TIME = datetime(NORMAL_NIGHT_DATE.year, NORMAL_NIGHT_DATE.month
 # ---------------------------------------------------------------------------
 # OCPP connection between chargers and the controller (CSMS)
 # ---------------------------------------------------------------------------
-CSMS_HOST = "localhost"
+# The controller listens on CSMS_HOST, the chargers connect to it. On one computer
+# both are "localhost". In Docker each program is its own container: the controller
+# listens on all addresses (0.0.0.0) and the chargers connect to the name "controller"
+# (set in docker-compose.yml).
+CSMS_HOST = os.environ.get("CSMS_HOST", "localhost")
 CSMS_PORT = 9000
 
 # Name both sides agree on when the WebSocket opens, so they know
@@ -185,7 +189,9 @@ HEARTBEAT_INTERVAL_S = 10
 # ---------------------------------------------------------------------------
 # Building energy meter (Modbus TCP)
 # ---------------------------------------------------------------------------
-METER_HOST = "localhost"
+# The meter listens on METER_HOST, the controller connects to it (in Docker: 0.0.0.0
+# for the meter, "meter" for the controller; see docker-compose.yml).
+METER_HOST = os.environ.get("METER_HOST", "localhost")
 # The standard Modbus TCP port is 502, but ports below 1024 need admin rights
 # on Linux, so the simulated meter uses 5020.
 METER_PORT = 5020

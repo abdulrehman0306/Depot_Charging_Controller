@@ -1,0 +1,16 @@
+# Files Docker must not copy into the image.
+
+# Secrets: they are passed to the containers as environment variables instead.
+.env
+
+# Local Python environment and caches (the image installs its own packages).
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Not needed to run the programs.
+.git/
+tests/
+grafana/
+results/

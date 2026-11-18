@@ -1,10 +1,77 @@
-# Starts InfluxDB (the database) and Grafana (the dashboard) with one command:
+# Starts the whole system with one command:
 #     docker compose up -d
-# Stage 7 adds the controller, the chargers and the meter to this file.
 #
-# All secrets come from the .env file (see .env.example); none are written here.
+#   meter       simulated building energy meter (Modbus TCP)
+#   controller  the CSMS: OCPP server, control loop, REST API on http://localhost:8000
+#   chargers    ten simulated chargers; this container stops when the last van has left
+#   influxdb    database for all measurements, http://localhost:8086
+#   grafana     dashboard, http://localhost:3000
+#
+# Secrets come from the .env file (see .env.example); none are written here.
+# Speed, scenario and strategy can be set in .env too (see .env.example); otherwise
+# the defaults below are used. All programs must use the same simulation speed.
+
+# Settings shared by the three Python programs (they use the same image, built from the Dockerfile).
+x-python-program: &python-program
+  build: .
+  image: depot-charging-controller:latest
+  environment: &simulation-settings
+    SIM_SPEED: ${SIM_SPEED:-60}
+    SCENARIO: ${SCENARIO:-normal_evening}
+    STRATEGY: ${STRATEGY:-smart}
 
 services:
+  meter:
+    <<: *python-program
+    command: ["python", "-m", "src.meter.modbus_meter"]
+    environment:
+      <<: *simulation-settings
+      # Listen on all addresses inside the container, so the controller can reach it.
+      METER_HOST: 0.0.0.0
+    healthcheck:
+      # "Healthy" as soon as the Modbus port accepts a connection.
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 5020), timeout=2)"]
+      interval: 2s
+      retries: 30
+
+  controller:
+    <<: *python-program
+    command: ["python", "-m", "src.controller.run_controller"]
+    ports:
+      - "8000:8000"
+    environment:
+      <<: *simulation-settings
+      CSMS_HOST: 0.0.0.0
+      API_HOST: 0.0.0.0
+      # Inside Docker the other programs are reached by their service names.
+      METER_HOST: meter
+      INFLUXDB_URL: http://influxdb:8086
+      INFLUXDB_ORG: ${INFLUXDB_ORG}
+      INFLUXDB_BUCKET: ${INFLUXDB_BUCKET}
+      INFLUXDB_TOKEN: ${INFLUXDB_TOKEN}
+    depends_on:
+      meter:
+        condition: service_healthy
+      influxdb:
+        condition: service_healthy
+    healthcheck:
+      # "Healthy" as soon as the OCPP port accepts a connection.
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 9000), timeout=2)"]
+      interval: 2s
+      retries: 60
+
+  chargers:
+    <<: *python-program
+    command: ["python", "-m", "src.chargers.run_chargers"]
+    environment:
+      <<: *simulation-settings
+      CSMS_HOST: controller
+    depends_on:
+      controller:
+        condition: service_healthy
+    # One night, then the chargers program ends. Do not start it again by itself.
+    restart: "no"
+
   influxdb:
     image: influxdb:2.7.11
     ports:
@@ -20,6 +87,10 @@ services:
       DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUXDB_TOKEN}
     volumes:
       - influxdb-data:/var/lib/influxdb2
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 2s
+      retries: 30
 
   grafana:
     image: grafana/grafana:11.5.2
@@ -32,8 +103,7 @@ services:
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
       # Open the depot dashboard as the home page.
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/depot_charging.json
-      # Used by grafana/provisioning/datasources/influxdb.yml. Inside Docker, Grafana
-      # reaches InfluxDB by its service name, not by "localhost".
+      # Used by grafana/provisioning/datasources/influxdb.yml.
       INFLUXDB_URL: http://influxdb:8086
       INFLUXDB_ORG: ${INFLUXDB_ORG}
       INFLUXDB_BUCKET: ${INFLUXDB_BUCKET}

@@ -189,3 +189,17 @@ async def test_a_lower_limit_from_the_api_is_seen_by_the_safety_check_at_once():
     # 22 kW building + 22 kW charging = 44 kW, above the new target of 50 - 15 = 35 kW:
     # the next control cycle starts a safety plan.
     assert controller.estimated_site_kw() > controller.target_kw()
+
+
+
+def test_measurements_are_stored_only_until_the_night_is_over():
+    controller = make_controller()
+    # Without a store nothing is stored.
+    assert controller.should_store_measurements() is False
+
+    controller.storage = object()
+    assert controller.should_store_measurements() is True
+
+    # All chargers gone and the summary printed: the night is over.
+    controller.summary_printed = True
+    assert controller.should_store_measurements() is False

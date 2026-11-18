@@ -1,0 +1,52 @@
+# GitHub Actions: on every push, GitHub starts a fresh Linux machine, installs Python
+# and the packages from requirements.txt, and runs the tests. The result shows as a
+# green tick or a red cross next to the commit on GitHub.
+#
+# Two jobs run side by side:
+#   quick-tests  everything except the whole simulated nights (about 20 seconds)
+#   night-tests  the whole simulated nights with real OCPP and Modbus connections (about 10 minutes)
+
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  quick-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Install Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Install the packages
+        run: pip install -r requirements.txt
+
+      - name: Run the quick tests
+        run: python -m pytest -m "not night" -v
+
+  night-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Install Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Install the packages
+        run: pip install -r requirements.txt
+
+      - name: Run the night tests
+        run: python -m pytest -m night -v --durations=10

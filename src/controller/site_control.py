@@ -200,7 +200,7 @@ class SiteController:
         now = self.clock.now()
         self.building_kw = await read_building_load_kw(self.meter_client, now, self.building_kw)
         self.record_sample(now)
-        if self.storage is not None:
+        if self.should_store_measurements():
             self.store_measurements(now)
 
         # Uncontrolled means no software: no plans and no safety layer.
@@ -448,6 +448,16 @@ class SiteController:
     # -----------------------------------------------------------------------
     # Logging and the end-of-night report
     # -----------------------------------------------------------------------
+
+    def should_store_measurements(self):
+        """
+        Out: True if this cycle's measurements should go to InfluxDB.
+
+        Only while there is a store, and until the night is over (all chargers gone, summary
+        printed). After that the program keeps running for the API, but an empty depot's
+        samples, at dates beyond the price data, would only fill the database.
+        """
+        return self.storage is not None and not self.summary_printed
 
     def store_measurements(self, now):
         """Hand this cycle's site, charger and price values to the store (written in the background)."""
