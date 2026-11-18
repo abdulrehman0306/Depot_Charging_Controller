@@ -89,6 +89,8 @@ $env:SIM_SPEED="600"; $env:SCENARIO="load_spike"; $env:STRATEGY="equal_sharing";
 
 Checked on a fresh run for this README: a smart night of the normal scenario at 600 times real time. The chargers container finished with exit code 0, all ten vans left with 92.1 to 95.8 %, the controller reported a peak of 135.0 kW at 01:47, 0 minutes over the limit, 0 safety actions, and 54 plans with none needing the fallback rule. The image is 706 MB; `.env` is kept out of it by `.dockerignore`, and the secrets reach the containers as environment variables.
 
+Clean-start check: a fresh clone of the repository, a new `.env` made from `.env.example` with new random values, a new virtual environment from `requirements.txt`. All 132 tests passed (10 minutes 18 seconds, including complete nights of every scenario with every strategy). Then `docker compose up` from the same clone, with empty volumes: the night ran (all ten vans left with 92.3 to 94.6 %, peak 135.0 kW, 0 minutes over, 78 plans, no fallback), InfluxDB stored 897 site samples, and Grafana reported "datasource is working" and loaded the dashboard with its 5 panels.
+
 ### The dashboard
 
 `grafana/dashboards/depot_charging.json` has five panels: site power against the grid limit and the planning target, building load, day-ahead price, charging power per charger, and state of charge per van. A drop-down at the top chooses the run. Grafana loads the dashboard and the InfluxDB data source by itself at start-up from `grafana/provisioning/`; the data source file holds no secrets, the token comes from the environment. The default time range is the normal night (14 to 15 January 2026); for `negative_prices` choose 4 to 5 October 2025.
