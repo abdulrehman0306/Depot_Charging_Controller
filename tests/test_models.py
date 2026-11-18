@@ -16,10 +16,12 @@ from src.meter.building_load import LoadSpike, building_load_kw
 from src.results import (
     charger_power_at,
     charging_cost_eur,
+    markdown_table,
     minutes_over_limit,
     over_limit_episodes,
     peak_site_power,
     spike_reaction_minutes,
+    summarize_week,
     van_results,
 )
 from src.scenarios import clock_time_on_day, generate_normal_evening
@@ -189,3 +191,38 @@ def test_minutes_over_limit_uses_the_limit_in_force_at_each_moment():
         site_log[minute]["site_limit_kw"] = 100.0
     assert minutes_over_limit(site_log, 150) == 2.0
     assert over_limit_episodes(site_log, 150) == [(START + timedelta(minutes=2), START + timedelta(minutes=4))]
+
+
+# ---------------------------------------------------------------------------
+# The week summary (src/results.py, used for the README table)
+# ---------------------------------------------------------------------------
+
+def make_week_nights():
+    """Two nights of one scenario with one strategy, in the format of results/nights.csv."""
+    return pd.DataFrame([
+        {"scenario": "impossible", "strategy": "smart", "night_number": 0, "peak_site_kw": 144.58,
+         "minutes_over_limit": 0.0, "vans": 10, "vans_reached_target": 8, "total_shortfall_kwh": 20.0,
+         "largest_shortfall_kwh": 15.0, "energy_kwh": 500.0, "cost_eur": 50.0, "spike_reaction_minutes": None,
+         "fallback_plans": 0},
+        {"scenario": "impossible", "strategy": "smart", "night_number": 1, "peak_site_kw": 149.99,
+         "minutes_over_limit": 2.0, "vans": 10, "vans_reached_target": 10, "total_shortfall_kwh": 0.0,
+         "largest_shortfall_kwh": 0.0, "energy_kwh": 300.0, "cost_eur": 10.0, "spike_reaction_minutes": None,
+         "fallback_plans": 1},
+    ])
+
+
+def test_week_summary_adds_up_the_nights():
+    summary = summarize_week(make_week_nights())
+    assert len(summary) == 1
+    row = summary.iloc[0]
+    assert row["peak_site_kw"] == 149.99
+    assert row["minutes_over_limit"] == 2.0
+    assert (row["van_visits"], row["vans_reached_target"]) == (20, 18)
+    assert (row["total_shortfall_kwh"], row["largest_shortfall_kwh"]) == (20.0, 15.0)
+    # The average price is the week's cost divided by the week's energy, not the mean of the nights.
+    assert row["cost_ct_per_kwh"] == pytest.approx(100 * 60.0 / 800.0)
+
+
+def test_week_table_never_rounds_a_peak_up_to_the_limit():
+    table = markdown_table(summarize_week(make_week_nights()))
+    assert "| Impossible | Smart | 149.9 kW | 2 | 18 of 20 | 20.0 kWh (15.0) | 800 kWh | 60.00 EUR | 7.50 ct/kWh |" in table

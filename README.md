@@ -1,263 +1,126 @@
-**Work in progress.**
-
 # Depot_Charging_Controller
 
 [![tests](https://github.com/abdulrehman0306/Depot_Charging_Controller/actions/workflows/tests.yml/badge.svg)](https://github.com/abdulrehman0306/Depot_Charging_Controller/actions/workflows/tests.yml)
 
-Software that charges a fleet of electric delivery vans on time, without going over the depot's grid connection limit, and as cheaply as possible.
+Software that charges a fleet of electric delivery vans overnight: every van ready on time, the depot never over its grid connection limit, and the electricity as cheap as possible.
 
-This project is being built in stages. This README will be completed at the end, with results that come from real runs of the code.
+![The Grafana dashboard of one smart night](results/dashboard.png)
 
-## Current state: Stage 7, Docker and automatic tests
+*One night of the smart controller in the Docker setup (14 to 15 January 2026, real day-ahead prices). The vans wait through the expensive evening and charge after midnight, up to the 135 kW planning target, never over the 150 kW limit.*
 
-### Programs
+## 1. What it does
 
-- `src/meter/modbus_meter.py`: a simulated building energy meter, a Modbus TCP server (pymodbus) on port 5020, unit id 1. It plays the building load of the chosen scenario.
-- `src/controller/run_controller.py`: starts the central controller (CSMS) and the REST API.
-  - `central_system.py`: the OCPP 2.0.1 side. It accepts the chargers, tracks what each one reports, and sends limits with SetChargingProfile.
-  - `site_control.py`: the control loop and the safety layer (see below).
-  - `strategies.py`: equal sharing.
-  - `smart_planner.py`: the smart controller's optimisation model (Pyomo, solved by HiGHS) and its fallback rule.
-  - `meter_reader.py`: the Modbus TCP client for the meter.
-  - `storage.py`: writes every control cycle's measurements to InfluxDB.
-- `src/api/app.py`: the REST API (FastAPI), served by the controller program.
-- `grafana/`: the Grafana dashboard (`dashboards/depot_charging.json`) and the provisioning files that load it and the InfluxDB data source automatically when Grafana starts.
-- `Dockerfile` and `docker-compose.yml`: start the whole system with one command (see "How to run").
-- `.github/workflows/tests.yml`: GitHub Actions runs all tests on every push.
-- `src/chargers/run_chargers.py`: starts one simulated 22 kW wallbox per van of the chosen scenario (`simulated_charger.py`), and prints each van's state of charge when it leaves.
+A central controller (a CSMS, "charging station management system") talks to ten simulated 22 kW chargers over **OCPP 2.0.1** and reads a simulated building energy meter over **Modbus TCP**. Once per simulated minute it decides how much current every charger may give, and sends it as a charging profile. It can do that in three ways (uncontrolled, equal sharing, and a smart controller that optimises against real German day-ahead prices), so they can be compared on the same nights.
 
-### Data
+Everything runs as separate programs connected over real network protocols, starts with one `docker compose up`, stores every measurement in InfluxDB, shows them in Grafana, and has a REST API to watch the site and change the grid limit while it runs.
 
-- **Day-ahead prices: real.** German day-ahead prices for the DE-LU bidding zone, in quarter hours, from SMARD.de (series 4169). The download and loading code in `src/prices.py` is taken from my earlier project [Battery_Revenue_Study](https://github.com/abdulrehman0306/Battery_Revenue_Study). The two weekly files the scenarios need are kept in `data/prices/`.
-  Source: Bundesnetzagentur | SMARD.de, licence CC BY 4.0.
-- **Van schedules: synthetic.** `src/scenarios.py`: random arrival times, departure times and arrival state of charge from made-up ranges in `settings.py` with a fixed seed, or set by hand for a test situation.
-- **Building load: synthetic.** `src/meter/building_load.py`: a made-up daily profile for a small depot in winter.
+## 2. The problem
 
-The scenarios play real nights from the price data:
+A delivery depot has 10 vans and 10 chargers of 22 kW each. The vans come back in the afternoon and evening and leave the next morning, and each must leave with at least 90 % charge.
 
-| Scenario | Night | What happens |
-|---|---|---|
-| `normal_evening` | 14 to 15 January 2026 | vans arrive between 16:00 and 20:00 |
-| `rush` | 14 to 15 January 2026 | all vans arrive between 19:00 and 19:30 |
-| `late_van` | 14 to 15 January 2026 | one van arrives at 22:30 with 10 % and must leave at 05:00 |
-| `charger_failure` | 14 to 15 January 2026 | charger CP02 loses its connection to the controller from 18:00 to 18:30 |
-| `load_spike` | 14 to 15 January 2026 | the building draws 40 kW extra from 19:30 to 19:50 |
-| `negative_prices` | 4 to 5 October 2025 | the night with the most negative prices in the data |
-| `impossible` | 14 to 15 January 2026 | ten nearly empty vans, 20:00 to 01:00: not enough energy for all of them |
+- **The grid connection is 150 kW**, and that includes the building (offices, lights, workshop, 15 to 45 kW). Ten chargers at full power would draw 220 kW plus the building. Without control the depot goes far over its limit every evening, which in reality means a tripped main breaker or expensive peak charges.
+- **The price changes every quarter hour.** On the German day-ahead market of 14 January 2026 a MWh cost 224.16 EUR at 17:30 and 82.36 EUR at 04:15 the next morning; 17:00 to 20:00 averaged 180.38 EUR/MWh, 01:00 to 05:00 only 86.89. A van that is plugged in at 18:00 and leaves at 07:00 does not need to charge at 18:00.
+- **The controller cannot see everything at once.** The building meter is read once a minute, so a sudden rise in building load is seen up to a minute late; chargers report their power every few minutes; a charger can lose its connection.
 
-The negative prices at night are real but mild: 35 negative quarter hours between 20:00 and 06:00, the lowest -5.09 EUR/MWh. In this data, strongly negative prices happen at midday in spring and summer, when the vans are out on their routes.
+## 3. System diagram
 
-### Supporting pieces
+```mermaid
+flowchart LR
+    subgraph depot["Depot (simulated)"]
+        meter["Building meter<br/>Modbus TCP server<br/>src/meter"]
+        chargers["10 chargers, 22 kW each<br/>OCPP 2.0.1 clients<br/>src/chargers"]
+    end
+    subgraph controller["Controller (CSMS), src/controller"]
+        loop["Control loop + safety layer<br/>once per simulated minute"]
+        strategy["Strategy: uncontrolled,<br/>equal sharing or smart<br/>(Pyomo + HiGHS)"]
+        api["REST API (FastAPI)<br/>port 8000"]
+    end
+    prices[("SMARD day-ahead prices<br/>data/prices")]
+    influx[("InfluxDB")]
+    grafana["Grafana dashboard<br/>port 3000"]
 
-- `src/meter/registers.py`: the meter's register map, and how values are packed into 16 bit registers (32 bit floats and scaled 32 bit integers over two registers, high word first). It is written for this project in the style of common industrial meters; it is not a copy of a real meter's map.
-- `src/sim_clock.py`: the simulated clock. The controller owns it. Chargers set their clocks from the `currentTime` in the controller's BootNotification and Heartbeat answers; the meter follows the time the controller writes into its clock registers (20-21).
-- `src/electrical.py`: kW to amps and back. Planning is in kW; limits are sent in amps per phase (3 x 230 V), rounded down to 0.1 A. Following IEC 61851-1, a charger is never given a limit between 0 and 6 A: below 6 A the van is paused (0 A).
-- `src/results.py`: scoring, the same functions for every strategy, including the energy cost at the day-ahead price.
-- `settings.py`: all settings in one place.
+    meter -- "building power (Modbus TCP, port 5020)" --> loop
+    loop -- "clock registers" --> meter
+    chargers <-- "OCPP 2.0.1 over WebSocket, port 9000:<br/>TransactionEvent, MeterValues ↔ SetChargingProfile" --> loop
+    loop <--> strategy
+    prices --> strategy
+    loop --> influx --> grafana
+    api <--> loop
+```
 
-OCPP messages used: BootNotification, Heartbeat, StatusNotification, TransactionEvent (with the van's RFID card as idToken), MeterValues, SetChargingProfile (TxProfile and TxDefaultProfile). They are built with the `ocpp` Python library by The Mobility House.
+- **OCPP messages used**: BootNotification, Heartbeat, StatusNotification, TransactionEvent (with the van's RFID card as idToken), MeterValues, SetChargingProfile (TxProfile and TxDefaultProfile). Built with the `ocpp` Python library by The Mobility House.
+- **Amps at the edge**: all planning is in kW; limits are sent to the chargers in amps per phase (3 x 230 V, 32 A = 22 kW), rounded down to 0.1 A, in one function (`src/electrical.py`). Following IEC 61851-1 a charger is never given a limit between 0 and 6 A: below 6 A the van pauses (0 A).
+- **Modbus register map** (`src/meter/registers.py`): power, voltages, currents, frequency and an energy counter as 32 bit values over two 16 bit registers, high word first, in the style of common industrial meters (not a copy of a real meter's map).
+- **One simulated clock**: the controller owns it. Chargers set their clocks from the `currentTime` in the controller's BootNotification and Heartbeat answers; the meter follows the time the controller writes into its clock registers (20-21). So the whole system can run a night 60 to 3000 times faster than real time.
 
-## Charging strategies
+## 4. How to run
 
-- **Uncontrolled**: no software. Every van charges at 22 kW from plug-in until full. No limit is enforced.
-- **Equal sharing**: the power available for charging is split equally between the vans that still want power, at most 22 kW each:
+### With Docker: the whole system with one command
 
-  available for charging = site limit (150 kW) - safety margin (15 kW) - building load (from the meter)
-
-  Because of the 6 A rule, a van gets either 0 or at least 4.14 kW. If there is not enough for every van, the vans at the front of a queue charge and the others pause. Every 15 minutes the queue rotates: vans that had to wait move to the front, so no van waits all night.
-- **Smart controller**: plans every van's charging for the rest of the night with an optimisation model, see below.
-
-## The smart controller
-
-Every quarter hour (and when a van arrives, fills up or leaves, or the safety layer asks), the controller asks one question:
-
-> How much power should each van get in each quarter hour from now until it leaves, so that every van reaches 90 % before departure, the site stays under its limit, and the electricity is as cheap as possible?
-
-It answers it with a small linear optimisation model, written with Pyomo and solved by HiGHS (`src/controller/smart_planner.py`). In plain words:
-
-- **What it decides**: the charging power of each van in each quarter hour until the last van leaves (up to about 60 quarter hours, 10 vans).
-- **What it must respect**:
-  - all vans together stay under the power available in each quarter hour: 135 kW minus the expected building load;
-  - no van gets more than a charger can give (21.94 kW, which is 31.8 A after rounding);
-  - no van is filled above 100 %;
-  - in the first quarter hour (the one that is sent to the chargers), each van gets 0 or at least 4.14 kW (the 6 A rule; this is the only yes/no decision in the model).
-- **What it tries to make small**, in this order of importance:
-  1. energy missing at departure below 90 %, at 110 to 200 EUR per kWh depending on the van's priority (far more than any electricity price, so the model charges every van it can before it looks at prices);
-  2. energy still missing 30 minutes before departure, at 1.10 to 2 EUR per kWh: the model wants every van finished early, so a short delay at the end cannot leave a van short;
-  3. the cost of the electricity at the day-ahead price of each quarter hour.
-
-Only the first quarter hour of the plan is sent to the chargers. The next quarter hour the controller plans again with the newest state of charge, meter reading and vans (a "rolling horizon").
-
-Details that matter:
-
-- **Departure times** come from the fleet schedule (in a real depot: the route planning system). The controller knows which van is on which charger from the van's RFID card, which the charger sends in the TransactionEvent that starts the session.
-- **Building load ahead**: the controller is given the typical daily profile as its forecast. This is a best case: it knows the normal pattern but not unplanned events like the load spike. Those are handled by the safety layer. A real depot would forecast from its own meter history.
-- **Reserve**: the plan aims for 92 %, not 90 %. Limits are rounded down to 0.1 A, and a planned power below 4.14 kW becomes 0 because of the 6 A rule; the 2 % (1.5 kWh) reserve absorbs these small losses.
-- **Plan delay**: a plan's limits only work once the plan is solved and sent; until then the old limits keep running. The controller measures this delay on its recent plans (median of the last 8) and starts each new plan's first quarter hour that much later.
-- **When not every van can make it** (the `impossible` scenario), the model decides who is served first: the van that leaves first, then the one that came back emptiest, then the charger number. These are known when the van arrives, so the order does not change during the night. The vans first in this order also get their energy earliest. The controller prints which vans will be short and by how much at every regular plan, hours before they leave.
-- **Fallback**: if the optimiser fails (no answer within 10 seconds, an error, or missing prices), the controller uses a simple rule for that quarter hour: the most urgent van first (least laxity: the van that can least afford to wait), up to 21.94 kW each, until the power is used up.
-
-## How the controller keeps the limit
-
-The controller runs a control cycle once per simulated minute, like a PLC with a cyclic interrupt:
-
-1. Read the building load from the meter.
-2. Estimate the site power: the meter value, plus for every charging van the higher of the power it last reported over OCPP and the power the controller has allowed it. The controller does not wait for the meter to see a change it caused itself. A van it has just allowed to charge is counted at once. A van it has told to slow down is counted at its old power until the charger reports the change.
-3. Make a new plan if it is a new quarter hour, if a van arrived, filled up or left, or (the safety layer) if the estimated site power is above the planning target of 135 kW.
-
-More rules keep the limit while limits change:
-
-- **A new van starts at 0 A.** At boot the controller sends every charger a TxDefaultProfile of 0 A. A van that plugs in between plans waits until the controller gives it a share, instead of starting at 22 kW.
-- **Make room first, then use it.** Reductions are sent first, to all chargers at the same time. Increases are sent only after the reduced chargers have reported their lower power.
-- **Never between 0 and 6 A**, as above.
-- **A charger that loses its connection** keeps charging with its last limit (OCPP 2.0.1 behaviour) and keeps its TransactionEvents in a queue, marked `offline`. The controller keeps counting it at that power and leaves that power out of every plan. When the charger reconnects, it sends its queued events and the controller carries on with what it knew about it.
-
-### The safety margin: 15 kW
-
-The controller sees the building load only once per meter reading (once per simulated minute). If the building load jumps just after a reading, the controller cannot react until the next one, so the charging power planned before the jump is still flowing. To keep the site under 150 kW anyway, the controller plans only up to 150 - 15 = 135 kW, so a jump of up to 15 kW fits in the free margin.
-
-Why 15 kW: it is the biggest step of the (synthetic) building profile between two meter readings, +15 kW at 05:00 and at 07:00. A test checks that the margin still covers the biggest step if the profile is changed. 5 % of the limit (7.5 kW) would not cover it. A real depot would choose the margin from measured meter data, for example the biggest one-interval rise seen over a year.
-
-A bigger, abnormal jump, like the 40 kW load spike, is not covered. Covering it with the margin alone would block 40 kW of charging power all night. Instead, the safety layer cuts charging at the next meter reading.
-
-### Reaction to the 40 kW load spike (equal sharing)
-
-Measured in Stage 4 in the `load_spike` scenario. Spike at 19:30, while about 135 kW was flowing:
-
-| Run | True time over the limit | Measured: spike start until the controller's site log is back under the limit |
-|---|---|---|
-| Test, 10 runs, simulation speed 300 | 2 minutes in every run (the true log has one-minute resolution) | 2.05 to 2.08 minutes |
-| Live demo, simulation speed 600 | not measured | 2.6 minutes |
-
-Where the time goes: up to 1 minute until the meter shows the spike (it updates once per simulated minute), and up to 1 minute until the controller reads it (once per simulated minute). The chargers then follow the lower limit within seconds. The controller's own log takes one sample per cycle, which can add up to one more minute to the measured value. A real system would read the meter every second or faster, so the same chain would take seconds, not minutes.
-
-With the smart controller the same spike did not take the site over the limit. In the live demo (simulation speed 600) no van was charging at 19:30, because prices were high, so the site went from 22 kW to 62 kW and the safety layer had nothing to do.
-
-## First results (Stage 5)
-
-One run of each night, all ten vans, the real day-ahead prices of that night. The full comparison over all scenarios comes in Stage 8.
-
-| Night | Strategy | Energy charged | Energy cost | Average price | Vans at 90 % or more | Minutes over 150 kW |
-|---|---|---|---|---|---|---|
-| 14 to 15 Jan 2026 | equal sharing | 561.1 kWh | 85.67 EUR | 15.27 ct/kWh | 10 of 10 | 0 |
-| 14 to 15 Jan 2026 | smart | 517.3 kWh | 44.85 EUR | 8.67 ct/kWh | 10 of 10 | 0 |
-| 4 to 5 Oct 2025 | equal sharing | 561.1 kWh | 0.49 EUR | 0.09 ct/kWh | 10 of 10 | 0 |
-| 4 to 5 Oct 2025 | smart | 560.9 kWh | -2.29 EUR | -0.41 ct/kWh | 10 of 10 | 0 |
-
-The energy cost is the day-ahead price only. Grid fees, taxes and levies are the same for every strategy and are left out. Equal sharing fills every van to 100 %, the smart controller stops at about 92 % unless prices are negative, so the fair comparison is the average price per kWh.
-
-In the live demo of the January night (smart, simulation speed 600) no van charged before midnight, while prices were high (up to 224 EUR/MWh at 17:30). From 00:00 to 05:00 the vans charged with the full 120 kW, in the cheapest hours of the night (down to 82 EUR/MWh). All ten vans left with 92.0 to 95.0 %, the site peaked at 135.0 kW, and none of the 78 plans needed the fallback rule.
-
-## Storage, dashboard and API
-
-### InfluxDB
-
-Every control cycle (one simulated minute) the controller writes three measurements to InfluxDB:
-
-| Measurement | Tags | Fields |
-|---|---|---|
-| `site` | run | building_kw, charging_kw, site_kw, estimated_site_kw, site_limit_kw, target_kw |
-| `charger` | run, charger_id, van_id | power_kw, allowed_power_kw, state_of_charge_percent, connected |
-| `price` | run | price_eur_per_mwh |
-
-The time of each point is the simulated time, so the dashboard shows the night's clock times and prices. Each run of the controller gets its own `run` tag (start time, strategy, scenario), because two runs of the same night have the same simulated times.
-
-Writing never holds up the control loop: each write is a background task. If InfluxDB is down, the measurements are lost and a warning is printed (at the first failure and then every 60th), but charging control carries on. This was checked by running a whole night with InfluxDB switched off: 841 writes failed, and the night ran normally.
-
-### Grafana dashboard
-
-`grafana/dashboards/depot_charging.json` has five panels: site power against the grid limit and the planning target, building load, day-ahead price, charging power per charger, and state of charge per van. A drop-down at the top chooses the run; the newest run is shown first. The default time range is the normal night (14 to 15 January 2026); for the `negative_prices` scenario choose 4 to 5 October 2025.
-
-Grafana loads the dashboard and the InfluxDB data source by itself when it starts, from `grafana/provisioning/`. The data source file holds no secrets: the token is filled in from the environment.
-
-Checked live (InfluxDB 2.7.11 and Grafana 11.5.2 in Docker, started from `docker-compose.yml` with the values from `.env`): InfluxDB set itself up with the `depot` bucket and accepted the token; Grafana's own health check of the provisioned data source answered "datasource is working. 3 buckets found"; the "Depot charging" dashboard was loaded from the JSON file with its 5 panels and is the home page. One smart night of the normal scenario (simulation speed 600) then stored 867 control cycles, from 15:34 to 07:44: 5,202 site values, 31,741 charger values and 867 prices, with no failed writes. All five panels showed the run, and the building load panel follows the synthetic profile step by step.
-
-The dashboard showed two faults that the tests had not, both fixed:
-
-- The first run stored nothing before 16:24, although the night starts at 15:30. Reading the price files and the solver's first solve took a few real seconds, and the simulated clock was already running. Now that work happens before the clock starts.
-- The very first meter reading was wrong (15 kW instead of 35 kW). The meter follows the controller's clock only at its next update after the clock has been written, so the first reading still showed the load for the meter's own clock. The controller now uses the safe high guess (60 kW) for that one first minute, which is the 60 kW at the start of the building load panel.
-
-The dashboard also shows how the smart controller works: on this night the quarter hour prices zig-zag after midnight, and the controller charges only in the cheaper ones. The 24 quarter hours with charging cost 89.0 EUR/MWh on average, the 26 quarter hours between 18:00 and 05:00 without charging 132.2 EUR/MWh (from the first run of this check).
-
-### REST API
-
-The controller program also serves a REST API (FastAPI) on http://127.0.0.1:8000. FastAPI makes an interactive page with all endpoints at http://127.0.0.1:8000/docs.
-
-| Endpoint | What it does |
-|---|---|
-| `GET /status` | the site now: simulated time, strategy, limit, planning target, building, charging and site power |
-| `GET /chargers` | every charger: connected or not, van, power, allowed power, state of charge |
-| `GET /vans` | every plugged-in van: charger, state of charge, departure time, the smart controller's planned shortfall |
-| `PUT /site-limit` | change the grid limit, e.g. `{"site_limit_kw": 120}`, between 20 and 400 kW |
-
-A new limit is used from the next control cycle. If the site is then above the new planning target (limit minus 15 kW), the safety layer cuts charging at once. In a live run (equal sharing, normal night, simulation speed 600) the limit was lowered from 150 to 100 kW at 19:36 while 6 vans were charging and the site drew 134.6 kW. The controller's next cycle, at 19:37:36, measured 34.6 kW over the new limit and cut charging; at 19:38:41 the site was back under 100 kW, and at 19:45 it drew 84.8 kW, just under the new 85 kW target. A request for 5 kW was refused with HTTP 422 and changed nothing. Time over the limit is always counted against the limit in force at that moment.
-
-### Secrets
-
-The InfluxDB token and the passwords are kept out of git. They live in a file called `.env`, which is listed in `.gitignore`. The repository only has `.env.example` with placeholder values. Before the first start:
+Needs Docker Desktop. First create the secrets file (it is in `.gitignore`; only `.env.example` with placeholders is in the repository):
 
 ```
 copy .env.example .env
 ```
 
-and replace every `change-me` value in `.env` with your own (for the token, a long random text). `settings.py` reads `.env` when the programs start. Without a token, the controller runs without storing measurements.
-
-## How to run
-
-### With Docker: everything with one command
-
-Needs Docker Desktop (running) and a `.env` file, created as described under "Secrets". Then, from the repository folder:
+and replace every `change-me` value in `.env` with your own (for the token, a long random text). Then:
 
 ```
 docker compose up -d
 ```
 
-This builds the image for the Python programs (the first time takes a few minutes) and starts six containers in this order:
+This builds one image for the three Python programs and starts the containers in order, each waiting until the ones it needs are healthy:
 
 | Container | What it is | Where to look |
 |---|---|---|
 | `influxdb` | the database | http://localhost:8086 |
 | `meter` | the simulated building meter (Modbus TCP) | |
 | `controller` | the CSMS with the control loop and the REST API | http://localhost:8000/docs |
-| `chargers` | the ten simulated chargers; stops when the last van has left | `docker compose logs chargers` |
-| `grafana` | the dashboard | http://localhost:3000 |
+| `chargers` | the ten simulated chargers; this container stops when the last van has left | `docker compose logs chargers` |
+| `grafana` | the dashboard (login: `GRAFANA_ADMIN_USER` and `GRAFANA_ADMIN_PASSWORD` from `.env`) | http://localhost:3000 |
 
-Each one waits until the ones it needs are ready: the controller waits for the meter and InfluxDB, the chargers wait for the controller. Grafana's login is `GRAFANA_ADMIN_USER` and `GRAFANA_ADMIN_PASSWORD` from your `.env`.
-
-With the default speed a night takes about 16 minutes. For a faster run, set the speed (and if you like the scenario and strategy) for this start only, in PowerShell:
+By default the smart controller runs the normal scenario at 60 times real time, so a night takes about 16 minutes. To choose for one start, in PowerShell:
 
 ```
-$env:SIM_SPEED="600"; docker compose up -d
+$env:SIM_SPEED="600"; $env:SCENARIO="load_spike"; $env:STRATEGY="equal_sharing"; docker compose up -d
 ```
 
-or permanently in `.env` (see `.env.example`). Useful commands:
+(or set them in `.env`). Scenarios: `normal_evening`, `rush`, `late_van`, `charger_failure`, `load_spike`, `negative_prices`, `impossible`. Strategies: `uncontrolled`, `equal_sharing`, `smart`. `docker compose down` stops everything; the data stays in the volumes.
+
+Checked on a fresh run for this README: a smart night of the normal scenario at 600 times real time. The chargers container finished with exit code 0, all ten vans left with 92.1 to 95.8 %, the controller reported a peak of 135.0 kW at 01:47, 0 minutes over the limit, 0 safety actions, and 54 plans with none needing the fallback rule. The image is 706 MB; `.env` is kept out of it by `.dockerignore`, and the secrets reach the containers as environment variables.
+
+### The dashboard
+
+`grafana/dashboards/depot_charging.json` has five panels: site power against the grid limit and the planning target, building load, day-ahead price, charging power per charger, and state of charge per van. A drop-down at the top chooses the run. Grafana loads the dashboard and the InfluxDB data source by itself at start-up from `grafana/provisioning/`; the data source file holds no secrets, the token comes from the environment. The default time range is the normal night (14 to 15 January 2026); for `negative_prices` choose 4 to 5 October 2025.
+
+The screenshot at the top was made by Grafana's image renderer, an extra container that only starts with a profile:
 
 ```
-docker compose ps                 which containers run, and whether they are healthy
-docker compose logs -f controller follow the controller's output
-docker compose logs chargers      the vans' results at the end of the night
-docker compose down               stop and remove the containers (the data stays in the volumes)
+docker compose --profile screenshot up -d
+python -m src.dashboard_screenshot
 ```
 
-Checked: one smart night of the normal scenario, all six containers, simulation speed 600. The chargers container finished with exit code 0, all ten vans left with 92.3 to 94.5 %, the site peaked at 135.0 kW with no minute over the limit, none of the 75 plans needed the fallback rule, and the night's 962 site samples reached InfluxDB. The image is 571 MB (Python 3.14.6 on Debian, all packages, the project code). `.env` is kept out of the image by `.dockerignore`; the secrets reach the containers as environment variables.
+### The REST API
+
+| Endpoint | What it does |
+|---|---|
+| `GET /status` | the site now: simulated time, strategy, limit, planning target, building, charging and site power |
+| `GET /chargers` | every charger: connected or not, van, power, allowed power, state of charge |
+| `GET /vans` | every plugged-in van: charger, state of charge, departure time, the smart controller's forecast shortfall |
+| `PUT /site-limit` | change the grid limit, e.g. `{"site_limit_kw": 120}`, between 20 and 400 kW |
+
+A new limit is used from the next control cycle. In a live run (equal sharing, simulation speed 600) the limit was lowered from 150 to 100 kW at 19:36 while the site drew 134.6 kW; the next cycle cut charging, at 19:38:41 the site was back under 100 kW, and at 19:45 it drew 84.8 kW, just under the new 85 kW target. A request for 5 kW is refused with HTTP 422.
 
 ### Without Docker, for development
-
-Set up once (Windows, from the repository folder):
 
 ```
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
-```
-
-Create `.env` as described under "Secrets". For storage and the dashboard, start only InfluxDB and Grafana in Docker:
-
-```
 docker compose up -d influxdb grafana
 ```
 
-Then start three programs in three terminals, in this order:
+then three programs in three terminals, in this order (set `$env:SIM_SPEED`, `$env:SCENARIO`, `$env:STRATEGY` the same way in each, if wanted):
 
 ```
 python -m src.meter.modbus_meter
@@ -265,41 +128,179 @@ python -m src.controller.run_controller
 python -m src.chargers.run_chargers
 ```
 
-Settings that can be changed without editing `settings.py`. Set them the same way in all three terminals before starting, for example:
+### The results and the tests
 
 ```
-set SIM_SPEED=600
-set SCENARIO=load_spike
-set STRATEGY=smart
+python -m src.run_week                 every scenario x strategy x 7 nights -> results/nights.csv (84 minutes here)
+python -m src.results                  tables and charts from results/nights.csv
+python -m src.measure_spike_reaction   the load spike reaction at a slow speed -> results/spike_reaction.csv
+python -m pytest -m "not night"        quick tests
+python -m pytest                       all tests, including complete simulated nights
 ```
 
-- `SIM_SPEED`: simulated seconds per real second. The default 60 means one simulated minute per real second; 600 runs one night in about 100 seconds.
-- `SCENARIO`: `normal_evening`, `rush`, `late_van`, `charger_failure`, `load_spike`, `negative_prices` or `impossible`.
-- `STRATEGY`: `uncontrolled`, `equal_sharing` or `smart` (the default).
-- `PRINT_OCPP_MESSAGES=1`: print every raw OCPP message.
+GitHub Actions runs all tests on every push, the quick tests and the night tests as two jobs on a fresh Linux machine (`.github/workflows/tests.yml`).
 
-To download the price files again (they are already in `data/prices/`):
+## 5. The strategies in simple words
 
-```
-python -m src.prices
-```
+- **Uncontrolled**: no software. Every van charges at 22 kW from plug-in until it is full. This is the baseline: what happens if nobody manages the chargers.
+- **Equal sharing**: the controller shares what is left under the limit equally between the vans that still want power:
 
-## Tests
+  available for charging = grid limit (150 kW) - safety margin (15 kW) - building load (from the meter)
 
-GitHub Actions runs all tests on every push (`.github/workflows/tests.yml`): the quick tests and the whole nights in two jobs side by side, on a fresh Linux machine. The badge at the top shows the result of the last run.
+  Because of the 6 A rule a van gets either 0 or at least 4.14 kW. If there is not enough for everyone, the vans at the front of a queue charge and the others pause; every 15 minutes the queue rotates, so no van waits all night. It keeps the limit but ignores prices.
+- **Smart**: every quarter hour the controller plans each van's charging until it leaves, with a small optimisation model (Pyomo, solved by HiGHS, `src/controller/smart_planner.py`). The question it answers: *how much power should each van get in each quarter hour, so that every van reaches 90 % before it leaves, the site stays under the limit, and the electricity is as cheap as possible?*
+  - It must respect: the available power in each quarter hour (135 kW minus the expected building load), at most 21.94 kW per charger, no battery above 100 %, and the 6 A rule for the quarter hour that is sent now.
+  - It minimises, in this order: energy missing at departure (110 to 200 EUR per kWh by van priority, far above any electricity price, so it charges every van it can before it looks at prices); energy still missing 30 minutes before departure (so a small delay at the end cannot leave a van short); and the cost at the day-ahead price.
+  - Only the first quarter hour is sent; the next quarter hour it plans again with fresh data (a rolling horizon). It aims at 92 % so rounding losses cannot leave a van below 90 %. If the solver fails, a simple rule takes over for that quarter hour: the van that can least afford to wait first.
+  - When not every van can make it, it serves vans in a fixed order: the one leaving first, then the one that came back emptiest. It reports which vans will be short, hours before they leave.
 
-To run them yourself, quick tests (about 20 seconds), without the whole simulated nights:
+### The safety layer (equal sharing and smart)
 
-```
-python -m pytest -m "not night"
-```
+The controller runs a control cycle once per simulated minute, like a PLC cyclic task:
 
-All tests (about 10 minutes):
+1. Read the building load from the meter.
+2. Estimate the site power: the meter value, plus for every charging van the higher of what it last reported over OCPP and what the controller has allowed it. So a change the controller made itself is counted at once, without waiting for the meter.
+3. If the estimate is above the planning target, cut charging now. Otherwise plan again at each quarter hour or when a van arrives, fills up or leaves.
 
-```
-python -m pytest
-```
+More rules: a newly plugged-in van starts at 0 A (a TxDefaultProfile sent at boot) until the controller gives it a share; reductions are sent first, to all chargers at once, and increases only after the reduced chargers have confirmed; a charger that loses its connection keeps its last limit (OCPP 2.0.1 behaviour), and the controller keeps its power reserved until it is back.
 
-The smart controller's shortfall forecast is tested on a stepped clock (`tests/stepped_night.py`): the controller's own planning code and the same van battery model, but the simulated time only moves when the test moves it, one minute at a time, and each plan's limits arrive after a delay from a fixed list. So it gives the same result on every run. The test checks what matters to a dispatcher: every van that really leaves short was warned about at 21:00, four hours before; each van's forecast is within 3 kWh; the total is within 20 %.
+**Why a 15 kW margin.** The building load is seen only once a minute. If it rises just after a reading, the charging power planned before is still flowing until the next one. 15 kW is the biggest one-minute step of the building profile (+15 kW at 05:00 and at 07:00), so planning to 150 - 15 = 135 kW keeps the true site under 150 kW through such a step. A test checks the margin still covers the biggest step if the profile changes. A real depot would take it from a year of its own meter data. An abnormal jump, like the 40 kW load spike, is not covered by the margin (that would block 40 kW of charging all night); the safety layer cuts charging at the next reading instead.
 
-The night tests run complete nights of every scenario with the real OCPP and Modbus connections. They check the true site power, rebuilt from what every charger really drew, not only what the controller measured. Nights with equal sharing run at 3000 times real time. Nights with the smart controller run at 1000 times real time, because each plan takes the optimiser about 80 real milliseconds; at 3000 times real time that would be 4 simulated minutes, far from reality (at the normal 60 times real time it is 5 simulated seconds).
+## 6. Results
+
+### How the results were made
+
+Every scenario was run with every strategy on **7 nights in a row: 147 complete nights**, each one the whole system (meter, controller, ten chargers over real OCPP and Modbus connections) at 1000 (smart) or 3000 (others) times real time. Each night has its own random seed for the vans, and the same vans for all three strategies. Every night is scored the same way from what really happened: the **true** site power, rebuilt from what each charger really drew plus the real building load, not what the controller thought. Raw results: `results/nights.csv`; summary: `results/week_summary.csv`.
+
+**Data**
+
+- **Day-ahead prices: real.** German day-ahead prices, DE-LU bidding zone, in quarter hours, from SMARD.de (series 4169). Source: Bundesnetzagentur | SMARD.de, licence CC BY 4.0. The download and loading code (`src/prices.py`) is reused from my earlier project [Battery_Revenue_Study](https://github.com/abdulrehman0306/Battery_Revenue_Study).
+  - **Date range in the repository**: 29 September to 12 October 2025, and 12 to 25 January 2026 (four weekly files in `data/prices/`).
+  - **Nights used in the week run**: 12 January 2026 15:30 to 19 January 2026 08:00 for six scenarios (prices 66.76 to 224.16 EUR/MWh, none negative), and 29 September 2025 15:30 to 6 October 2025 08:00 for `negative_prices` (-5.09 to 408.50 EUR/MWh, 149 negative quarter hours, 56 of them between 20:00 and 06:00). Neither week has a clock change.
+  - Single runs (Docker, most tests) use the night of 14 to 15 January 2026, and 4 to 5 October 2025 for `negative_prices`.
+- **Van schedules: synthetic**: arrival and departure times and arrival charge drawn from made-up ranges in `settings.py` with a fixed seed (75 kWh usable battery, 92 % charging efficiency).
+- **Building load: synthetic**: a made-up daily winter profile for a small depot.
+
+**Scenarios**
+
+| Scenario | What happens |
+|---|---|
+| Normal evening | vans arrive at staggered times between 16:00 and 20:00 |
+| Rush | all vans arrive within 30 minutes |
+| Late van | like normal, but one van arrives at 22:30 with 10 % and must leave at 05:00 |
+| Charger failure | charger CP02 loses its connection to the controller from 18:00 to 18:30 (it keeps charging) |
+| Load spike | the building draws 40 kW extra from 19:30 to 19:50 |
+| Negative prices | like normal, on the October week with negative night prices |
+| Impossible | ten nearly empty vans from 20:00 to 01:00: the connection cannot deliver enough energy for all |
+
+### The week in one table
+
+Each line is 7 nights, 70 van visits. Peak site power is the highest true value of the week (rounded down, so 149.99 shows as 149.9). Energy cost is the day-ahead price only; grid fees, taxes and levies are the same for every strategy and are left out.
+
+| Scenario | Strategy | Peak site power | Minutes over 150 kW | Vans at 90 % | Shortfall (largest van) | Energy | Cost | Average price |
+|---|---|---|---|---|---|---|---|---|
+| Normal evening | Uncontrolled | 211.0 kW | 768 | 70 of 70 | 0 | 3,895 kWh | 505.35 EUR | 12.98 ct/kWh |
+| Normal evening | Equal sharing | 134.9 kW | 0 | 70 of 70 | 0 | 3,895 kWh | 490.06 EUR | 12.58 ct/kWh |
+| Normal evening | Smart | 149.9 kW | 0 | 70 of 70 | 0 | 3,536 kWh | 314.30 EUR | 8.89 ct/kWh |
+| Rush | Uncontrolled | 242.0 kW | 1047 | 70 of 70 | 0 | 3,897 kWh | 445.94 EUR | 11.44 ct/kWh |
+| Rush | Equal sharing | 134.8 kW | 0 | 70 of 70 | 0 | 3,897 kWh | 419.42 EUR | 10.76 ct/kWh |
+| Rush | Smart | 149.9 kW | 0 | 70 of 70 | 0 | 3,510 kWh | 311.76 EUR | 8.88 ct/kWh |
+| Late van | Uncontrolled | 189.0 kW | 569 | 70 of 70 | 0 | 4,006 kWh | 502.99 EUR | 12.55 ct/kWh |
+| Late van | Equal sharing | 134.9 kW | 0 | 70 of 70 | 0 | 4,006 kWh | 493.74 EUR | 12.32 ct/kWh |
+| Late van | Smart | 149.9 kW | 0 | 70 of 70 | 0 | 3,658 kWh | 325.83 EUR | 8.91 ct/kWh |
+| Charger failure | Uncontrolled | 211.0 kW | 775 | 70 of 70 | 0 | 3,895 kWh | 505.11 EUR | 12.97 ct/kWh |
+| Charger failure | Equal sharing | 134.9 kW | 0 | 70 of 70 | 0 | 3,895 kWh | 490.58 EUR | 12.60 ct/kWh |
+| Charger failure | Smart | 149.9 kW | 0 | 70 of 70 | 0 | 3,537 kWh | 314.18 EUR | 8.88 ct/kWh |
+| Load spike | Uncontrolled | 238.0 kW | 785 | 70 of 70 | 0 | 3,895 kWh | 505.42 EUR | 12.98 ct/kWh |
+| Load spike | Equal sharing | 174.6 kW | 17 | 70 of 70 | 0 | 3,895 kWh | 487.90 EUR | 12.53 ct/kWh |
+| Load spike | Smart | 149.9 kW | 0 | 70 of 70 | 0 | 3,542 kWh | 314.68 EUR | 8.88 ct/kWh |
+| Negative prices | Uncontrolled | 211.0 kW | 769 | 70 of 70 | 0 | 3,895 kWh | 525.87 EUR | 13.50 ct/kWh |
+| Negative prices | Equal sharing | 134.9 kW | 0 | 70 of 70 | 0 | 3,895 kWh | 479.04 EUR | 12.30 ct/kWh |
+| Negative prices | Smart | 149.9 kW | 0 | 70 of 70 | 0 | 3,606 kWh | 175.56 EUR | 4.87 ct/kWh |
+| Impossible | Uncontrolled | 242.0 kW | 1475 | 70 of 70 | 0 | 5,421 kWh | 571.66 EUR | 10.54 ct/kWh |
+| Impossible | Equal sharing | 134.4 kW | 0 | 0 of 70 | 781.0 kWh (11.3) | 4,002 kWh | 407.47 EUR | 10.18 ct/kWh |
+| Impossible | Smart | 144.5 kW | 0 | 55 of 70 | 878.5 kWh (63.8) | 4,018 kWh | 409.64 EUR | 10.19 ct/kWh |
+
+### What the numbers say
+
+- **Uncontrolled charging breaks the limit every night.** The site reached 189 to 242 kW, and was over 150 kW for 569 to 1,475 minutes per week, depending on the scenario.
+- **Both controlled strategies kept the limit in every scenario**, with one exception: the load spike with equal sharing (see below). Every van reached 90 % in all six possible scenarios with every strategy.
+- **The smart controller paid 29 % less per kWh than equal sharing and 32 % less than uncontrolled** on the normal week (8.89 against 12.58 and 12.98 ct/kWh). On the week with negative night prices it paid 4.87 ct/kWh, 60 % less than equal sharing. Over the normal week it cost 314.30 EUR against 505.35 EUR uncontrolled; part of that difference is less energy, because uncontrolled charging and equal sharing fill every van to 100 %, while the smart controller stops at about 92 %. The average price per kWh is the fair comparison.
+- **The smart peaks of 149.9 kW are the safety margin doing its job.** The smart controller charges at the full 135 kW target in cheap hours, also at 05:00, when the building profile steps up by 15 kW. In a re-run of the night of 18 to 19 January the true site went from 134.85 to 149.85 kW at 05:00 for two minutes, until the next plan took the step into account (134.88 kW at 05:02). Equal sharing charges at full power only in the evening, when the building load is steady, so it stays at 135 kW.
+- **When the energy is simply not there** (impossible scenario), the strategies differ in who pays for it. Equal sharing spreads the shortage: none of the 70 vans reached 90 %, each was about 11 kWh short (at most 11.3 kWh). The smart controller serves vans in priority order: 55 of 70 reached 90 %, and 15 were short by up to 63.8 kWh, each one announced hours before departure. Its total shortfall is higher (878.5 against 781.0 kWh) because the vans it finished got their 2 % reserve above 90 %, energy that does not count against the shortfall. Uncontrolled charging filled all vans, at 242 kW on a 150 kW connection.
+- **The smart controller made 3,378 plans in the week; none needed the fallback rule.**
+
+### Charts
+
+![True site power on one night for the three strategies](results/example_night_site_power.png)
+
+*The night of 12 to 13 January 2026, normal evening. Uncontrolled charging goes up to 198 kW in the evening. Equal sharing holds 135 kW in the evening. The smart controller waits for the cheap hours after midnight.*
+
+![The smart controller's charging power against the day-ahead price](results/smart_charging_and_price.png)
+
+![Average price paid per kWh, per scenario and strategy](results/week_price_per_kwh.png)
+
+![Minutes over the grid limit in the week, per scenario and strategy](results/week_minutes_over_limit.png)
+
+### Reaction to the 40 kW load spike
+
+The spike starts at 19:30, while equal sharing draws about 135 kW, so the true site jumps to about 175 kW. Measured on all 7 nights of the week at 300 times real time (`python -m src.measure_spike_reaction`, `results/spike_reaction.csv`):
+
+| | Every one of the 7 nights |
+|---|---|
+| True time over the limit (one-minute resolution) | 2.0 minutes |
+| Spike start until the controller's own site log is back under the limit | 2.06 to 2.08 minutes |
+| Peak site power | 174.40 to 174.61 kW |
+
+Where the time goes: up to 1 minute until the meter shows the spike (it updates once per simulated minute), up to 1 minute until the controller reads it; the chargers then follow within seconds. A real system would read the meter every second or faster, so the same chain would take seconds.
+
+The week table shows 17 minutes over the limit for this case (2 to 4 minutes in 6 of the 7 nights) because the week ran at 3000 times real time. There a simulated minute is 20 real milliseconds, and the few milliseconds each control cycle takes on the computer already add simulated time to the reaction; at 300 times real time that effect is gone. The safety layer's logic is the same in both; only the speed of the simulation differs.
+
+With the smart controller the spike never took the site over the limit: at 19:30 prices are high, so few or no vans were charging and the extra 40 kW fitted under 150 kW.
+
+### Things the live runs found that the tests had not
+
+- **A simulation that is too fast distorts timing**: the load spike above. That is also why the smart controller is tested at 1000 and not 3000 times real time: one plan takes the optimiser about 80 real milliseconds, which would be 4 simulated minutes at 3000x.
+- **Start-up work counts**: in the first Docker run the dashboard showed no data before 16:24 although the night starts at 15:30. Reading the price files and the solver's first solve had taken real seconds while the simulated clock was already running. Now they run before the clock starts.
+- **The first meter reading can be stale**: the meter follows the controller's clock only at its next update, so the very first reading showed the load for the meter's own clock. The controller now uses a safe high guess (60 kW) for that one first minute.
+- **Storage must never block control**: each InfluxDB write is a background task. A whole night with InfluxDB switched off had 841 failed writes and otherwise ran normally.
+
+## 7. Limitations
+
+- **Synthetic arrivals and building load.** Van schedules come from made-up ranges with a fixed seed, and the building load is a made-up daily profile. Only the prices are real.
+- **Simulated chargers.** The chargers are Python programs that follow the OCPP 2.0.1 messages; they follow a new limit within seconds. Real chargers and vehicles can take several seconds to react, some round the current differently, and some vehicles refuse to restart after a pause.
+- **A simplified OCPP subset.** Only the messages listed under the system diagram: no security profiles (TLS, certificates), no authorisation against a backend, no firmware updates or diagnostics, no reservations.
+- **No ISO 15118.** The controller does not get the van's state of charge, battery size or departure time from the vehicle; the simulated charger reports the state of charge, and departure times come from a fleet schedule.
+- **No phase imbalance.** All chargers draw the same current on all three phases; single-phase vans and per-phase limits of the connection are not modelled.
+- **No battery charging curve.** A van takes the full allowed power until it is full; real batteries take less power near full.
+- **Day-ahead price only.** Grid fees, taxes and levies are left out; per kWh they are the same for every strategy. Peak demand charges are left out too; they would make uncontrolled charging look worse still.
+- **Perfect forecasts for the plan.** The smart controller knows each van's departure time and the typical building profile. Unplanned events are left to the safety layer.
+
+## 8. Next steps
+
+- Forecast the building load from the depot's own meter history instead of a fixed profile, and choose the safety margin from a year of measured one-minute rises.
+- Read the meter much faster (every second), which would cut the load spike reaction from about 2 minutes to seconds.
+- Add a battery charging curve and per-phase limits to the van and charger models, and the same limits to the optimiser.
+- Use the departure time and energy request a vehicle sends over ISO 15118 (in OCPP 2.0.1: NotifyEVChargingNeeds) instead of a fleet schedule.
+- Add peak demand charges to the cost, and test against a real charger or an OCPP test tool to check the protocol side.
+
+## 9. Related project
+
+The day-ahead price data and its loader come from my earlier project **[Battery_Revenue_Study](https://github.com/abdulrehman0306/Battery_Revenue_Study)**, which studies the revenue a grid battery can earn on the same German day-ahead prices. This project uses the same prices from the other side: a load that can choose when to buy.
+
+## Project layout
+
+| Path | What it is |
+|---|---|
+| `settings.py` | all settings in one place (limits, margin, van and price settings, ports) |
+| `src/controller/` | the CSMS: OCPP server (`central_system.py`), control loop and safety layer (`site_control.py`), equal sharing (`strategies.py`), smart planner (`smart_planner.py`), meter client, InfluxDB storage |
+| `src/chargers/` | the simulated OCPP 2.0.1 chargers and the van battery model |
+| `src/meter/` | the simulated Modbus TCP meter, its register map and the building load profile |
+| `src/api/app.py` | the REST API |
+| `src/scenarios.py` | the seven scenarios |
+| `src/simulation.py` | runs one complete night in one process, for the tests and the week run |
+| `src/run_week.py`, `src/results.py`, `src/measure_spike_reaction.py` | the results above |
+| `src/prices.py`, `data/prices/` | SMARD price download and the price files |
+| `grafana/` | dashboard JSON and provisioning |
+| `results/` | the result files, charts and the dashboard screenshot |
+| `tests/` | unit tests and complete simulated nights |

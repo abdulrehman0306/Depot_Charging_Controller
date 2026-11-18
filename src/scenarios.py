@@ -78,14 +78,14 @@ def generate_normal_evening(arrival_day=settings.NORMAL_NIGHT_DATE, number_of_va
     return generate_vans(arrival_day, number_of_vans, seed, settings.ARRIVAL_EARLIEST, settings.ARRIVAL_LATEST)
 
 
-def rush_vans(day):
+def rush_vans(day, seed=settings.RANDOM_SEED):
     """Scenario 2 vans: all arrive between 19:00 and 19:30. Out: list of Van."""
-    return generate_vans(day, settings.NUMBER_OF_CHARGERS, settings.RANDOM_SEED, "19:00", "19:30")
+    return generate_vans(day, settings.NUMBER_OF_CHARGERS, seed, "19:00", "19:30")
 
 
-def late_van_vans(day):
+def late_van_vans(day, seed=settings.RANDOM_SEED):
     """Scenario 3 vans: normal evening, but the last van comes at 22:30 with 10 % and leaves at 05:00."""
-    vans = generate_normal_evening(day)
+    vans = generate_normal_evening(day, seed=seed)
     vans[-1] = Van(vans[-1].van_id, clock_time_on_day(day, "22:30"),
                    clock_time_on_day(day + timedelta(days=1), "05:00"), 10.0)
     return vans
@@ -105,36 +105,41 @@ def impossible_vans(day):
     return vans
 
 
-def get_scenario(name):
+def get_scenario(name, night_date=None, seed=settings.RANDOM_SEED):
     """
-    In: scenario name.
+    In: scenario name; optionally the date the night starts and the random seed for the
+        vans (default: the scenario's own night, and RANDOM_SEED).
     Out: dict with
          name, night_date, start_time (when the simulation starts),
          vans (list of Van), load_spikes (list of LoadSpike),
          charger_outages (list of dicts with charger_id, start_time, duration_minutes).
     """
-    day = settings.NORMAL_NIGHT_DATE
+    if night_date is not None:
+        day = night_date
+    elif name == "negative_prices":
+        day = settings.NEGATIVE_PRICE_NIGHT_DATE
+    else:
+        day = settings.NORMAL_NIGHT_DATE
     load_spikes = []
     charger_outages = []
 
     if name == "normal_evening":
-        vans = generate_normal_evening(day)
+        vans = generate_normal_evening(day, seed=seed)
     elif name == "rush":
-        vans = rush_vans(day)
+        vans = rush_vans(day, seed)
     elif name == "late_van":
-        vans = late_van_vans(day)
+        vans = late_van_vans(day, seed)
     elif name == "charger_failure":
-        vans = generate_normal_evening(day)
+        vans = generate_normal_evening(day, seed=seed)
         # CP02's van (V02) arrives at 17:10, so it is plugged in at 18:00.
         charger_outages = [{"charger_id": "CP02", "start_time": clock_time_on_day(day, "18:00"),
                             "duration_minutes": 30}]
     elif name == "load_spike":
-        vans = generate_normal_evening(day)
+        vans = generate_normal_evening(day, seed=seed)
         # A late workshop job (e.g. compressor and welding) while many vans are charging.
         load_spikes = [LoadSpike(clock_time_on_day(day, "19:30"), 20, 40.0)]
     elif name == "negative_prices":
-        day = settings.NEGATIVE_PRICE_NIGHT_DATE
-        vans = generate_normal_evening(day)
+        vans = generate_normal_evening(day, seed=seed)
     elif name == "impossible":
         vans = impossible_vans(day)
     else:

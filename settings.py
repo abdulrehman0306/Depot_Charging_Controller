@@ -161,6 +161,14 @@ TIMEZONE = ZoneInfo("Europe/Berlin")
 NORMAL_NIGHT_DATE = date(2026, 1, 14)
 NEGATIVE_PRICE_NIGHT_DATE = date(2025, 10, 4)
 
+# The results (src/run_week.py) play every scenario on 7 nights in a row, each night with
+# its own random seed (RANDOM_SEED + night number) and the real prices of that night.
+# The negative price scenario uses the week around its night, all other scenarios a
+# January week. Both weeks have no change of summer or winter time.
+WEEK_FIRST_NIGHT = date(2026, 1, 12)
+NEGATIVE_PRICE_WEEK_FIRST_NIGHT = date(2025, 9, 29)
+NIGHTS_PER_WEEK = 7
+
 # A run starts at this clock time on the night's date: just before the first van can arrive.
 SIMULATION_START_CLOCK = "15:30"
 

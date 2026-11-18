@@ -16,6 +16,7 @@ Two kinds of site log are used:
   to prove the limit holds.
 """
 
+import math
 from datetime import timedelta
 
 import settings
@@ -201,3 +202,217 @@ def van_results(vans, completed_visits):
             "shortfall_kwh": missing_percent / 100 * settings.VAN_BATTERY_USABLE_KWH,
         })
     return results
+
+
+# ---------------------------------------------------------------------------
+# Tables and charts of the week results (python -m src.results)
+# ---------------------------------------------------------------------------
+# These read results/nights.csv, written by src/run_week.py. pandas and matplotlib
+# are imported inside the functions, so the controller, which uses the scoring
+# functions above, does not have to load them.
+
+STRATEGIES = ["uncontrolled", "equal_sharing", "smart"]
+STRATEGY_LABELS = {"uncontrolled": "Uncontrolled", "equal_sharing": "Equal sharing", "smart": "Smart"}
+SCENARIO_LABELS = {"normal_evening": "Normal evening", "rush": "Rush", "late_van": "Late van",
+                   "charger_failure": "Charger failure", "load_spike": "Load spike",
+                   "negative_prices": "Negative prices", "impossible": "Impossible"}
+
+# Chart colours: categorical slots 1 to 3 of the reference palette, in fixed order,
+# one per strategy. Reference lines (limit, target) are grey ink, not a series colour.
+STRATEGY_COLORS = {"uncontrolled": "#2a78d6", "equal_sharing": "#eb6834", "smart": "#1baf7a"}
+SURFACE_COLOR = "#fcfcfb"
+TEXT_COLOR = "#0b0b0b"
+SECONDARY_TEXT_COLOR = "#52514e"
+GRID_COLOR = "#e4e3df"
+
+
+def summarize_week(nights):
+    """
+    One row per scenario and strategy, over its 7 nights.
+
+    In: pandas DataFrame of results/nights.csv.
+    Out: pandas DataFrame with the week's numbers per scenario and strategy.
+    """
+    import pandas as pd
+
+    rows = []
+    for (scenario, strategy), group in nights.groupby(["scenario", "strategy"], sort=False):
+        energy_kwh = group["energy_kwh"].sum()
+        reactions = group["spike_reaction_minutes"].dropna()
+        rows.append({
+            "scenario": scenario,
+            "strategy": strategy,
+            "nights": len(group),
+            "peak_site_kw": group["peak_site_kw"].max(),
+            "minutes_over_limit": group["minutes_over_limit"].sum(),
+            "van_visits": int(group["vans"].sum()),
+            "vans_reached_target": int(group["vans_reached_target"].sum()),
+            "total_shortfall_kwh": group["total_shortfall_kwh"].sum(),
+            "largest_shortfall_kwh": group["largest_shortfall_kwh"].max(),
+            "energy_kwh": energy_kwh,
+            "cost_eur": group["cost_eur"].sum(),
+            "cost_ct_per_kwh": 100 * group["cost_eur"].sum() / energy_kwh,
+            "spike_reaction_mean_minutes": reactions.mean() if len(reactions) else None,
+            "spike_reaction_max_minutes": reactions.max() if len(reactions) else None,
+            "fallback_plans": int(group["fallback_plans"].sum()),
+        })
+    return pd.DataFrame(rows)
+
+
+def markdown_table(summary):
+    """In: the week summary. Out: a Markdown table for the README, one line per scenario and strategy."""
+    lines = ["| Scenario | Strategy | Peak site power | Minutes over 150 kW | Vans at 90 % | Shortfall (largest van) "
+             "| Energy | Cost | Average price |",
+             "|---|---|---|---|---|---|---|---|---|"]
+    for row in summary.itertuples():
+        if row.total_shortfall_kwh < 0.05:
+            shortfall = "0"
+        else:
+            shortfall = f"{row.total_shortfall_kwh:.1f} kWh ({row.largest_shortfall_kwh:.1f})"
+        # Rounded down, so that a peak of 149.99 kW does not show as 150.0 kW.
+        peak_kw = math.floor(row.peak_site_kw * 10) / 10
+        lines.append(f"| {SCENARIO_LABELS[row.scenario]} | {STRATEGY_LABELS[row.strategy]} | {peak_kw:.1f} kW "
+                     f"| {row.minutes_over_limit:.0f} | {row.vans_reached_target} of {row.van_visits} | {shortfall} "
+                     f"| {row.energy_kwh:,.0f} kWh | {row.cost_eur:,.2f} EUR | {row.cost_ct_per_kwh:.2f} ct/kWh |")
+    return "\n".join(lines)
+
+
+def style_axes(axes, title, y_label):
+    """Recessive grid and axes, plain text in ink colours."""
+    axes.set_facecolor(SURFACE_COLOR)
+    axes.set_title(title, loc="left", color=TEXT_COLOR, fontsize=12)
+    axes.set_ylabel(y_label, color=SECONDARY_TEXT_COLOR)
+    axes.grid(axis="y", color=GRID_COLOR, linewidth=0.8)
+    axes.set_axisbelow(True)
+    for side in ["top", "right"]:
+        axes.spines[side].set_visible(False)
+    for side in ["left", "bottom"]:
+        axes.spines[side].set_color(GRID_COLOR)
+    axes.tick_params(colors=SECONDARY_TEXT_COLOR)
+
+
+def plot_example_night(example, path):
+    """
+    True site power of one night for the three strategies, with the grid limit and planning target.
+
+    In: DataFrame of results/example_night.csv, output path.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+    import pandas as pd
+
+    figure, axes = plt.subplots(figsize=(10, 4.8), facecolor=SURFACE_COLOR)
+    for strategy in STRATEGIES:
+        night = example[example["strategy"] == strategy]
+        times = pd.to_datetime(night["time"], utc=True).dt.tz_convert("Europe/Berlin")
+        axes.plot(times, night["site_kw"], color=STRATEGY_COLORS[strategy], linewidth=2,
+                  label=STRATEGY_LABELS[strategy], drawstyle="steps-post")
+    limit_kw = settings.SITE_LIMIT_KW
+    target_kw = settings.SITE_LIMIT_KW - settings.SAFETY_MARGIN_KW
+    axes.axhline(limit_kw, color=SECONDARY_TEXT_COLOR, linewidth=1.5, linestyle="--")
+    axes.axhline(target_kw, color=SECONDARY_TEXT_COLOR, linewidth=1, linestyle=":")
+    axes.text(axes.get_xlim()[0], limit_kw + 3, "  grid limit 150 kW", color=SECONDARY_TEXT_COLOR, fontsize=9)
+    axes.text(axes.get_xlim()[0], target_kw - 9, "  planning target 135 kW", color=SECONDARY_TEXT_COLOR, fontsize=9)
+    axes.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz="Europe/Berlin"))
+    axes.set_ylim(0, None)
+    style_axes(axes, "True site power on the night of 12 to 13 January 2026 (normal evening)", "kW")
+    axes.legend(frameon=False, loc="upper left", bbox_to_anchor=(0, -0.08), ncol=3)
+    figure.tight_layout()
+    figure.savefig(path, dpi=150, facecolor=SURFACE_COLOR)
+    plt.close(figure)
+
+
+def plot_week_bars(summary, column, title, y_label, path):
+    """
+    One group of bars per scenario, one bar per strategy.
+
+    In: the week summary, the column to show, chart title, y axis label, output path.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    scenarios = list(dict.fromkeys(summary["scenario"]))
+    bar_width = 0.26
+    figure, axes = plt.subplots(figsize=(11, 4.6), facecolor=SURFACE_COLOR)
+    for position, strategy in enumerate(STRATEGIES):
+        values = []
+        for scenario in scenarios:
+            match = summary[(summary["scenario"] == scenario) & (summary["strategy"] == strategy)]
+            values.append(match[column].iloc[0])
+        bar_centres = [index + (position - 1) * bar_width for index in range(len(scenarios))]
+        # A thin gap between neighbouring bars: an edge in the surface colour.
+        axes.bar(bar_centres, values, bar_width, color=STRATEGY_COLORS[strategy], label=STRATEGY_LABELS[strategy],
+                 edgecolor=SURFACE_COLOR, linewidth=2)
+    axes.set_xticks(range(len(scenarios)))
+    axes.set_xticklabels([SCENARIO_LABELS[scenario] for scenario in scenarios])
+    axes.axhline(0, color=SECONDARY_TEXT_COLOR, linewidth=0.8)
+    style_axes(axes, title, y_label)
+    axes.legend(frameon=False, loc="upper left", bbox_to_anchor=(0, -0.1), ncol=3)
+    figure.tight_layout()
+    figure.savefig(path, dpi=150, facecolor=SURFACE_COLOR)
+    plt.close(figure)
+
+
+def plot_smart_and_price(example, prices, path):
+    """
+    Two panels with one shared time axis: the day-ahead price, and the smart controller's
+    charging power, on the example night. Two measures, two panels, never two y axes.
+
+    In: DataFrame of results/example_night.csv, price Series, output path.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+    import pandas as pd
+
+    night = example[example["strategy"] == "smart"]
+    times = pd.to_datetime(night["time"], utc=True).dt.tz_convert("Europe/Berlin")
+    night_prices = prices[times.min():times.max()]
+
+    figure, (price_axes, power_axes) = plt.subplots(2, 1, figsize=(10, 5.6), sharex=True, facecolor=SURFACE_COLOR)
+    # The price is not one of the strategies, so it is drawn in ink, not in a strategy colour.
+    price_axes.plot(night_prices.index, night_prices.values, color=SECONDARY_TEXT_COLOR, linewidth=2,
+                    drawstyle="steps-post")
+    style_axes(price_axes, "Day-ahead price (SMARD, DE-LU), 12 to 13 January 2026", "EUR/MWh")
+    power_axes.plot(times, night["charging_kw"], color=STRATEGY_COLORS["smart"], linewidth=2, drawstyle="steps-post")
+    style_axes(power_axes, "Smart controller: charging power of all vans together", "kW")
+    power_axes.set_ylim(0, None)
+    power_axes.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz="Europe/Berlin"))
+    figure.tight_layout()
+    figure.savefig(path, dpi=150, facecolor=SURFACE_COLOR)
+    plt.close(figure)
+
+
+def main():
+    """Make the summary tables and the charts from results/nights.csv and results/example_night.csv."""
+    from pathlib import Path
+
+    import pandas as pd
+
+    from src.prices import load_prices
+
+    folder = Path(__file__).resolve().parent.parent / "results"
+    nights = pd.read_csv(folder / "nights.csv")
+    example = pd.read_csv(folder / "example_night.csv")
+
+    summary = summarize_week(nights)
+    summary.round(2).to_csv(folder / "week_summary.csv", index=False)
+    (folder / "week_summary.md").write_text(markdown_table(summary) + "\n", encoding="utf-8")
+
+    plot_example_night(example, folder / "example_night_site_power.png")
+    # Uncontrolled and equal sharing fill every van to 100 %, smart stops near 90 %, so the
+    # fair comparison is the price paid per kWh, not the total in EUR.
+    plot_week_bars(summary, "cost_ct_per_kwh", "Average day-ahead price paid per kWh charged, over the week",
+                   "ct/kWh", folder / "week_price_per_kwh.png")
+    plot_week_bars(summary, "minutes_over_limit", "Minutes over the 150 kW grid limit in the week (true site power)",
+                   "minutes", folder / "week_minutes_over_limit.png")
+    plot_smart_and_price(example, load_prices(), folder / "smart_charging_and_price.png")
+    print(markdown_table(summary))
+
+
+if __name__ == "__main__":
+    main()
