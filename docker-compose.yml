@@ -1,7 +1,8 @@
 # Starts the whole system with one command:
 #     docker compose up -d
 #
-#   meter       simulated building energy meter (Modbus TCP)
+#   mqtt        MQTT broker (Mosquitto); the meter publishes its readings here
+#   meter       simulated building energy meter (Modbus TCP, and publishes over MQTT)
 #   controller  the CSMS: OCPP server, control loop, REST API on http://localhost:8000
 #   chargers    ten simulated chargers; this container stops when the last van has left
 #   influxdb    database for all measurements, http://localhost:8086
@@ -23,8 +24,24 @@ x-python-program: &python-program
     SIM_SPEED: ${SIM_SPEED:-60}
     SCENARIO: ${SCENARIO:-normal_evening}
     STRATEGY: ${STRATEGY:-smart}
+    # Where the controller reads the building load: modbus (default) or mqtt.
+    BUILDING_LOAD_SOURCE: ${BUILDING_LOAD_SOURCE:-modbus}
+    MQTT_HOST: mqtt
 
 services:
+  mqtt:
+    image: eclipse-mosquitto:2.0.23
+    ports:
+      # Only reachable from this computer, e.g. to watch the readings with mosquitto_sub.
+      - "127.0.0.1:1883:1883"
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    healthcheck:
+      # "Healthy" as soon as a subscriber gets the broker's own uptime message.
+      test: ["CMD", "mosquitto_sub", "-h", "localhost", "-t", "$$SYS/broker/uptime", "-C", "1", "-W", "3"]
+      interval: 2s
+      retries: 30
+
   meter:
     <<: *python-program
     command: ["python", "-m", "src.meter.modbus_meter"]
@@ -32,6 +49,9 @@ services:
       <<: *simulation-settings
       # Listen on all addresses inside the container, so the controller can reach it.
       METER_HOST: 0.0.0.0
+    depends_on:
+      mqtt:
+        condition: service_healthy
     healthcheck:
       # "Healthy" as soon as the Modbus port accepts a connection.
       test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost', 5020), timeout=2)"]
@@ -55,6 +75,8 @@ services:
       INFLUXDB_TOKEN: ${INFLUXDB_TOKEN}
     depends_on:
       meter:
+        condition: service_healthy
+      mqtt:
         condition: service_healthy
       influxdb:
         condition: service_healthy

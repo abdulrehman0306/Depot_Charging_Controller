@@ -31,7 +31,11 @@ def is_over_limit(sample, site_limit_kw):
     """
     In: one site log sample, the site limit [kW] to use if the sample does not hold its own.
     Out: True if the site power was over the limit in force at that moment.
+         A controller sample whose building load was the safe guess, not a reading, is
+         never counted: its site power was not measured (see building_is_guess).
     """
+    if sample.get("building_is_guess"):
+        return False
     limit_kw = sample.get("site_limit_kw", site_limit_kw)
     return sample["site_kw"] > limit_kw + POWER_TOLERANCE_KW
 

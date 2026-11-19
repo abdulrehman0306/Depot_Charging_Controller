@@ -211,6 +211,51 @@ METER_DEVICE_ID = 1
 # room for charging, never more.
 BUILDING_LOAD_IF_METER_UNKNOWN_KW = 60.0
 
+# ---------------------------------------------------------------------------
+# MQTT: the meter also publishes its readings to a broker (Mosquitto)
+# ---------------------------------------------------------------------------
+# Where the controller gets the building load from: "modbus" (it reads the meter's
+# registers, the default) or "mqtt" (it subscribes to the readings the meter publishes).
+BUILDING_LOAD_SOURCE = os.environ.get("BUILDING_LOAD_SOURCE", "modbus")
+if BUILDING_LOAD_SOURCE not in ("modbus", "mqtt"):
+    raise ValueError(f"BUILDING_LOAD_SOURCE must be 'modbus' or 'mqtt', not '{BUILDING_LOAD_SOURCE}'")
+
+# The MQTT broker. 1883 is the standard port for MQTT without encryption.
+# 127.0.0.1 rather than "localhost": on Windows "localhost" is first tried over IPv6,
+# where the broker is not published (docker-compose.yml), which costs 2 s per connection.
+MQTT_HOST = os.environ.get("MQTT_HOST", "127.0.0.1")
+MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
+
+# Topics: every topic starts with this prefix. Tests use their own prefix, so they
+# never mix with a running depot on the same broker.
+MQTT_TOPIC_PREFIX = "depot"
+
+# QoS 1, "at least once": the broker confirms every message, and the sender sends it
+# again until it is confirmed. A reading can arrive twice, which does no harm here.
+MQTT_QOS = 1
+
+# A reading over MQTT is only used while it is fresh: its time stamp must be at most
+# this many simulated minutes away from the controller's clock. After that the controller
+# uses BUILDING_LOAD_IF_METER_UNKNOWN_KW, the same safe high guess as for a missing meter value.
+# The meter publishes once per minute. To get over one missed or late reading, the limit is
+#     1 minute     the missed reading
+#   + 1 minute     the controller reads once per minute, at any point between two readings
+#   + 0.5 minute   the reading is already a little old when it arrives: network delay,
+#                  and the meter's clock is a few seconds behind the controller's
+MQTT_READING_MAX_AGE_MINUTES = 2.5
+
+# The meter sets its clock to the controller's time from the clock topic only when it
+# is more than this many simulated minutes off. Both clocks run at the same speed, so
+# after the first time they stay together, and the small jitter of the network delay
+# does not move the meter's clock back and forth. NTP clients work the same way: they
+# only jump the clock for a large difference.
+MQTT_CLOCK_TOLERANCE_MINUTES = 0.25
+
+# How often the MQTT clients try to reconnect after losing the broker: first after
+# this many real seconds, doubling up to the maximum.
+MQTT_RECONNECT_MIN_DELAY_S = 1
+MQTT_RECONNECT_MAX_DELAY_S = 5
+
 # How often a charging charger reports its meter, in simulated minutes.
 METER_VALUE_INTERVAL_MINUTES = 5
 

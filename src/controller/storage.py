@@ -40,6 +40,8 @@ def site_point(sample, run_name, site_limit_kw, target_kw):
             .field("estimated_site_kw", float(sample["estimated_site_kw"]))
             .field("site_limit_kw", float(site_limit_kw))
             .field("target_kw", float(target_kw))
+            # True when the building load was the safe guess, not a meter reading.
+            .field("building_is_guess", bool(sample.get("building_is_guess", False)))
             .time(sample["time"]))
 
 

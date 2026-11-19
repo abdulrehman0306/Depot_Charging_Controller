@@ -4,7 +4,8 @@ that reads the meter and decides the power limits, the REST API, and (if an
 InfluxDB token is set in .env) the writing of measurements to InfluxDB.
 
 The controller owns the simulated clock. Chargers set their clocks from it
-over OCPP, and the meter through its clock registers.
+over OCPP, and the meter through its clock registers (or over MQTT, when the
+building load is read over MQTT).
 
 Start the meter first, then run:
     python -m src.controller.run_controller
@@ -20,6 +21,7 @@ import settings
 from src.api.app import create_app
 from src.controller.central_system import start_csms_server
 from src.controller.meter_reader import create_meter_client
+from src.controller.mqtt_meter_reader import MqttMeterReader
 from src.controller.site_control import SiteController
 from src.controller.smart_planner import warm_up_solver
 from src.controller.storage import MeasurementStore
@@ -64,7 +66,7 @@ async def run_controller():
         warm_up_solver()
     clock = SimulationClock(scenario["start_time"], settings.SIMULATED_SECONDS_PER_REAL_SECOND)
     chargers_by_id = {}
-    meter_client = create_meter_client(settings.METER_HOST, settings.METER_PORT)
+    meter_client = create_building_load_source()
 
     await start_csms_server(settings.CSMS_HOST, settings.CSMS_PORT, chargers_by_id, clock,
                             default_limit_for_strategy(settings.STRATEGY))
@@ -72,7 +74,11 @@ async def run_controller():
     events.info("listening on ws://%s:%s, strategy: %s, scenario: %s (night of %s), simulation speed: %sx",
                 settings.CSMS_HOST, settings.CSMS_PORT, settings.STRATEGY, scenario["name"],
                 scenario["night_date"], settings.SIMULATED_SECONDS_PER_REAL_SECOND)
-    events.info("reading building meter at %s:%s over Modbus TCP", settings.METER_HOST, settings.METER_PORT)
+    if settings.BUILDING_LOAD_SOURCE == "mqtt":
+        events.info("reading the building load over MQTT, topic %s on %s:%s", meter_client.power_topic,
+                    settings.MQTT_HOST, settings.MQTT_PORT)
+    else:
+        events.info("reading building meter at %s:%s over Modbus TCP", settings.METER_HOST, settings.METER_PORT)
 
     storage = create_storage()
     run_name = f"{datetime.now():%Y-%m-%d %H:%M:%S} {settings.STRATEGY} {scenario['name']}"
@@ -93,6 +99,20 @@ async def run_controller():
     finally:
         if storage is not None:
             await storage.close()
+        if isinstance(meter_client, MqttMeterReader):
+            meter_client.stop()
+
+
+def create_building_load_source():
+    """
+    Out: where the controller reads the building load, chosen by settings.BUILDING_LOAD_SOURCE:
+         a Modbus TCP client for the meter (the default), or an MQTT reader (already started).
+    """
+    if settings.BUILDING_LOAD_SOURCE == "mqtt":
+        reader = MqttMeterReader(settings.MQTT_HOST, settings.MQTT_PORT)
+        reader.start()
+        return reader
+    return create_meter_client(settings.METER_HOST, settings.METER_PORT)
 
 
 def create_storage():

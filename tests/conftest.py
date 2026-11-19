@@ -1,8 +1,12 @@
 """
 Shared test helpers. pytest loads this file by itself; every test can ask
-for a fixture (csms, meter) by naming it as an argument. run_night and
+for a fixture (csms, meter, mqtt_topic_prefix) by naming it as an argument. run_night and
 run_scenario_night run the whole system for one night.
 """
+
+import os
+import socket
+import uuid
 
 import pytest
 
@@ -60,6 +64,28 @@ async def meter():
     await server.shutdown()
 
 
+@pytest.fixture
+def mqtt_topic_prefix():
+    """
+    For tests that need the MQTT broker (Mosquitto at settings.MQTT_HOST:MQTT_PORT).
+
+    If no broker is running, the test is skipped, with how to start one. In GitHub Actions
+    (MQTT_BROKER_REQUIRED=1) the test fails instead, so it can never be skipped there unseen.
+
+    Gives a topic prefix of this test's own, so tests never mix with each other or with
+    a depot running on the same broker.
+    """
+    try:
+        socket.create_connection((settings.MQTT_HOST, settings.MQTT_PORT), timeout=2).close()
+    except OSError:
+        message = (f"no MQTT broker at {settings.MQTT_HOST}:{settings.MQTT_PORT}; "
+                   "start one with: docker compose up -d mqtt")
+        if os.environ.get("MQTT_BROKER_REQUIRED") == "1":
+            pytest.fail(message)
+        pytest.skip(message)
+    return f"test-{uuid.uuid4().hex[:12]}"
+
+
 # A full night takes a few seconds, and several tests look at the same night.
 # Each night is run once and the result kept here for the other tests.
 _finished_nights = {}
@@ -81,7 +107,7 @@ async def run_scenario_night(scenario_name, strategy_name, site_limit_kw=setting
 
 async def run_night(vans, load_spikes, strategy_name, site_limit_kw=settings.SITE_LIMIT_KW,
                     simulation_speed=TEST_SIMULATION_SPEED, start_time=settings.SIMULATION_START_TIME,
-                    charger_outages=()):
+                    charger_outages=(), building_load_source="modbus", mqtt_topic_prefix=settings.MQTT_TOPIC_PREFIX):
     """The whole system for one night with the test prices (see src/simulation.run_night)."""
     return await simulation.run_night(vans, load_spikes, strategy_name, PRICES, site_limit_kw, simulation_speed,
-                                      start_time, charger_outages)
+                                      start_time, charger_outages, building_load_source, mqtt_topic_prefix)

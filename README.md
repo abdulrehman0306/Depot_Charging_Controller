@@ -10,7 +10,7 @@ Software that charges a fleet of electric delivery vans overnight: every van rea
 
 ## 1. What it does
 
-A central controller (a CSMS, "charging station management system") talks to ten simulated 22 kW chargers over **OCPP 2.0.1** and reads a simulated building energy meter over **Modbus TCP**. Once per simulated minute it decides how much current every charger may give, and sends it as a charging profile. It can do that in three ways (uncontrolled, equal sharing, and a smart controller that optimises against real German day-ahead prices), so they can be compared on the same nights.
+A central controller (a CSMS, "charging station management system") talks to ten simulated 22 kW chargers over **OCPP 2.0.1** and reads a simulated building energy meter over **Modbus TCP**, or, chosen by a setting, over **MQTT** from a Mosquitto broker that the meter publishes its readings to, like an IoT energy meter. Once per simulated minute it decides how much current every charger may give, and sends it as a charging profile. It can do that in three ways (uncontrolled, equal sharing, and a smart controller that optimises against real German day-ahead prices), so they can be compared on the same nights.
 
 Everything runs as separate programs connected over real network protocols, starts with one `docker compose up`, stores every measurement in InfluxDB, shows them in Grafana, and has a REST API to watch the site and change the grid limit while it runs.
 
@@ -27,9 +27,10 @@ A delivery depot has 10 vans and 10 chargers of 22 kW each. The vans come back i
 ```mermaid
 flowchart LR
     subgraph depot["Depot (simulated)"]
-        meter["Building meter<br/>Modbus TCP server<br/>src/meter"]
+        meter["Building meter<br/>Modbus TCP server<br/>+ MQTT publisher<br/>src/meter"]
         chargers["10 chargers, 22 kW each<br/>OCPP 2.0.1 clients<br/>src/chargers"]
     end
+    broker["MQTT broker<br/>Mosquitto, port 1883"]
     subgraph controller["Controller (CSMS), src/controller"]
         loop["Control loop + safety layer<br/>once per simulated minute"]
         strategy["Strategy: uncontrolled,<br/>equal sharing or smart<br/>(Pyomo + HiGHS)"]
@@ -39,8 +40,12 @@ flowchart LR
     influx[("InfluxDB")]
     grafana["Grafana dashboard<br/>port 3000"]
 
-    meter -- "building power (Modbus TCP, port 5020)" --> loop
+    meter -- "building power (Modbus TCP, port 5020)<br/>default" --> loop
     loop -- "clock registers" --> meter
+    meter -- "publish depot/meter/building_power_kw<br/>once per minute, QoS 1" --> broker
+    broker -- "subscribed: readings<br/>(BUILDING_LOAD_SOURCE=mqtt)" --> loop
+    loop -. "publish depot/controller/clock" .-> broker
+    broker -. "subscribed: clock" .-> meter
     chargers <-- "OCPP 2.0.1 over WebSocket, port 9000:<br/>TransactionEvent, MeterValues ↔ SetChargingProfile" --> loop
     loop <--> strategy
     prices --> strategy
@@ -51,7 +56,38 @@ flowchart LR
 - **OCPP messages used**: BootNotification, Heartbeat, StatusNotification, TransactionEvent (with the van's RFID card as idToken), MeterValues, SetChargingProfile (TxProfile and TxDefaultProfile). Built with the `ocpp` Python library by The Mobility House.
 - **Amps at the edge**: all planning is in kW; limits are sent to the chargers in amps per phase (3 x 230 V, 32 A = 22 kW), rounded down to 0.1 A, in one function (`src/electrical.py`). Following IEC 61851-1 a charger is never given a limit between 0 and 6 A: below 6 A the van pauses (0 A).
 - **Modbus register map** (`src/meter/registers.py`): power, voltages, currents, frequency and an energy counter as 32 bit values over two 16 bit registers, high word first, in the style of common industrial meters (not a copy of a real meter's map).
-- **One simulated clock**: the controller owns it. Chargers set their clocks from the `currentTime` in the controller's BootNotification and Heartbeat answers; the meter follows the time the controller writes into its clock registers (20-21). So the whole system can run a night 60 to 3000 times faster than real time.
+- **One simulated clock**: the controller owns it. Chargers set their clocks from the `currentTime` in the controller's BootNotification and Heartbeat answers; the meter follows the time the controller writes into its clock registers (20-21), or, when the building load is read over MQTT, the time the controller publishes on its clock topic. So the whole system can run a night 60 to 3000 times faster than real time.
+
+### MQTT: the meter as an IoT device
+
+The meter always does two things: it keeps its Modbus registers up to date, and once per simulated minute it **publishes** its reading to the MQTT broker. The setting `BUILDING_LOAD_SOURCE` chooses which one the controller uses: `modbus` (the default) or `mqtt`.
+
+**Publish and subscribe, simply.** With Modbus the controller asks the meter "what is your power?" and the meter answers (polling). With MQTT nobody asks. Every program connects to one broker (Mosquitto, a small server). The meter *publishes* each reading to a **topic**, a name like a file path, and does not know or care who receives it. The controller *subscribes* to that topic once, and from then on the broker forwards every new reading to it. A dashboard, a logger or a second controller could subscribe to the same topic without the meter changing at all.
+
+| Topic | Who publishes | Who subscribes | Message |
+|---|---|---|---|
+| `depot/meter/building_power_kw` | meter, once per simulated minute | controller | `{"time": "2026-01-14T16:52:00+01:00", "power_kw": 35.0}` |
+| `depot/controller/clock` | controller, once per cycle (only in MQTT mode) | meter | the simulated time in Unix seconds, e.g. `1768405943` |
+
+Topic names are levels split by `/`, and a subscriber can use wildcards: `depot/#` means "everything under depot". To watch the live messages while the system runs:
+
+```
+docker compose exec mqtt mosquitto_sub -t "depot/#" -v
+```
+
+**QoS (quality of service)** is how hard the broker and the clients try to deliver a message:
+
+- **QoS 0, "at most once"**: send it and forget it. Fast, but a message can be lost.
+- **QoS 1, "at least once"**: the receiver confirms each message, and the sender repeats it until the confirmation comes. Nothing is lost, but a message can arrive twice.
+- **QoS 2, "exactly once"**: a four-step handshake makes sure it arrives exactly once. The slowest.
+
+This project uses **QoS 1** for both topics. A reading that arrives twice does no harm (same time stamp, same value), and losing readings is what QoS 1 prevents. QoS 2's extra handshake buys nothing here.
+
+**A lost connection is handled on the safe side.** With polling, a failed request tells the controller at once that something is wrong. With publish/subscribe, a broken broker, network or meter just means that *no more messages come*, and silence looks the same as "nothing changed". So every reading carries the meter's time stamp, and the controller only uses a reading that is at most **2.5 simulated minutes** old: one missed reading (1 minute), plus up to 1 minute because the controller reads at any point between two readings, plus half a minute for network delay and the meter's clock being a few seconds behind. Without a fresh reading it uses the **same safe high guess (60 kW)** as for a meter it cannot read over Modbus, which leaves less room for charging, never more. Both MQTT clients reconnect by themselves (after 1 s, then up to every 5 s) and subscribe again after each reconnect. Cycles that used the guess are marked in the controller's log and in InfluxDB (`building_is_guess`), and are not counted as measured time over the limit.
+
+**Checked live in Docker** (load spike night, equal sharing, building load over MQTT, simulation speed 600): the 40 kW spike at 19:30 was caught over MQTT, and the site was back under the limit after 2.2 minutes. Then the broker was stopped for 10 real seconds (`docker compose stop mqtt`). The controller's newest reading was from 22:32:49; at 22:35:50 it switched to the 60 kW safe guess. Both clients reconnected by themselves when the broker was back, and from 00:51:19 the readings were fresh again. Over the night: 816 cycles with a fresh reading, 135 with the safe guess, 1 measured minute over the limit (the spike), and all ten vans left with 100.0 % (equal sharing fills every van).
+
+**Under test** (`tests/test_mqtt.py`), against a real Mosquitto: a reading travels from the meter to the controller; an old reading, no reading and no broker all give the safe guess; a connection cut in the middle (a small relay between controller and broker is cut and restored) gives the safe guess until the client has reconnected by itself, and then fresh readings again; the meter follows the controller's clock over MQTT; and a whole load spike night over MQTT keeps the limit like Modbus, with a fresh reading in at least 97 % of the cycles.
 
 ## 4. How to run
 
@@ -73,8 +109,9 @@ This builds one image for the three Python programs and starts the containers in
 
 | Container | What it is | Where to look |
 |---|---|---|
+| `mqtt` | the MQTT broker (Mosquitto) | port 1883, only from this computer |
 | `influxdb` | the database | http://localhost:8086 |
-| `meter` | the simulated building meter (Modbus TCP) | |
+| `meter` | the simulated building meter (Modbus TCP, and publishes over MQTT) | |
 | `controller` | the CSMS with the control loop and the REST API | http://localhost:8000/docs |
 | `chargers` | the ten simulated chargers; this container stops when the last van has left | `docker compose logs chargers` |
 | `grafana` | the dashboard (login: `GRAFANA_ADMIN_USER` and `GRAFANA_ADMIN_PASSWORD` from `.env`) | http://localhost:3000 |
@@ -85,7 +122,7 @@ By default the smart controller runs the normal scenario at 60 times real time, 
 $env:SIM_SPEED="600"; $env:SCENARIO="load_spike"; $env:STRATEGY="equal_sharing"; docker compose up -d
 ```
 
-(or set them in `.env`). Scenarios: `normal_evening`, `rush`, `late_van`, `charger_failure`, `load_spike`, `negative_prices`, `impossible`. Strategies: `uncontrolled`, `equal_sharing`, `smart`. `docker compose down` stops everything; the data stays in the volumes.
+(or set them in `.env`). To read the building load over MQTT instead of Modbus, add `$env:BUILDING_LOAD_SOURCE="mqtt"`. Scenarios: `normal_evening`, `rush`, `late_van`, `charger_failure`, `load_spike`, `negative_prices`, `impossible`. Strategies: `uncontrolled`, `equal_sharing`, `smart`. `docker compose down` stops everything; the data stays in the volumes.
 
 Checked on a fresh run for this README: a smart night of the normal scenario at 600 times real time. The chargers container finished with exit code 0, all ten vans left with 92.1 to 95.8 %, the controller reported a peak of 135.0 kW at 01:47, 0 minutes over the limit, 0 safety actions, and 54 plans with none needing the fallback rule. The image is 706 MB; `.env` is kept out of it by `.dockerignore`, and the secrets reach the containers as environment variables.
 
@@ -119,10 +156,10 @@ A new limit is used from the next control cycle. In a live run (equal sharing, s
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
-docker compose up -d influxdb grafana
+docker compose up -d influxdb grafana mqtt
 ```
 
-then three programs in three terminals, in this order (set `$env:SIM_SPEED`, `$env:SCENARIO`, `$env:STRATEGY` the same way in each, if wanted):
+then three programs in three terminals, in this order (set `$env:SIM_SPEED`, `$env:SCENARIO`, `$env:STRATEGY`, `$env:BUILDING_LOAD_SOURCE` the same way in each, if wanted):
 
 ```
 python -m src.meter.modbus_meter
@@ -140,7 +177,7 @@ python -m pytest -m "not night"        quick tests
 python -m pytest                       all tests, including complete simulated nights
 ```
 
-GitHub Actions runs all tests on every push, the quick tests and the night tests as two jobs on a fresh Linux machine (`.github/workflows/tests.yml`).
+The MQTT tests need the broker (`docker compose up -d mqtt`); without it they are skipped with a message saying so. GitHub Actions runs all tests on every push, the quick tests and the night tests as two jobs on a fresh Linux machine (`.github/workflows/tests.yml`). Both jobs start Mosquitto first and set `MQTT_BROKER_REQUIRED=1`, so there a missing broker fails the MQTT tests instead of skipping them.
 
 ## 5. The strategies in simple words
 
@@ -272,6 +309,7 @@ With the smart controller the spike never took the site over the limit: at 19:30
 - **Synthetic arrivals and building load.** Van schedules come from made-up ranges with a fixed seed, and the building load is a made-up daily profile. Only the prices are real.
 - **Simulated chargers.** The chargers are Python programs that follow the OCPP 2.0.1 messages; they follow a new limit within seconds. Real chargers and vehicles can take several seconds to react, some round the current differently, and some vehicles refuse to restart after a pause.
 - **A simplified OCPP subset.** Only the messages listed under the system diagram: no security profiles (TLS, certificates), no authorisation against a backend, no firmware updates or diagnostics, no reservations.
+- **An open MQTT broker.** Mosquitto accepts clients without user name or password and without TLS. It is only published on this computer (127.0.0.1); a real depot would use passwords or client certificates and TLS (port 8883).
 - **No ISO 15118.** The controller does not get the van's state of charge, battery size or departure time from the vehicle; the simulated charger reports the state of charge, and departure times come from a fleet schedule.
 - **No phase imbalance.** All chargers draw the same current on all three phases; single-phase vans and per-phase limits of the connection are not modelled.
 - **No battery charging curve.** A van takes the full allowed power until it is full; real batteries take less power near full.
@@ -297,7 +335,8 @@ The day-ahead price data and its loader come from my earlier project **[Battery_
 | `settings.py` | all settings in one place (limits, margin, van and price settings, ports) |
 | `src/controller/` | the CSMS: OCPP server (`central_system.py`), control loop and safety layer (`site_control.py`), equal sharing (`strategies.py`), smart planner (`smart_planner.py`), meter client, InfluxDB storage |
 | `src/chargers/` | the simulated OCPP 2.0.1 chargers and the van battery model |
-| `src/meter/` | the simulated Modbus TCP meter, its register map and the building load profile |
+| `src/meter/` | the simulated Modbus TCP meter, its register map, the building load profile, and its MQTT publisher |
+| `src/mqtt_link.py`, `src/controller/mqtt_meter_reader.py`, `mosquitto/` | MQTT topics and message format, the controller's MQTT reader, the broker's configuration |
 | `src/api/app.py` | the REST API |
 | `src/scenarios.py` | the seven scenarios |
 | `src/simulation.py` | runs one complete night in one process, for the tests and the week run |

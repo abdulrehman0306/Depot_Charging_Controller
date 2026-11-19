@@ -4,7 +4,9 @@
 #
 # Two jobs run side by side:
 #   quick-tests  everything except the whole simulated nights (about 20 seconds)
-#   night-tests  the whole simulated nights with real OCPP and Modbus connections (about 10 minutes)
+#   night-tests  the whole simulated nights with real OCPP, Modbus and MQTT connections (about 10 minutes)
+#
+# Both start an MQTT broker (Mosquitto) in Docker first, for the MQTT tests.
 
 name: tests
 
@@ -15,6 +17,9 @@ on:
 jobs:
   quick-tests:
     runs-on: ubuntu-latest
+    env:
+      # The MQTT tests must not be skipped here: fail if the broker is missing.
+      MQTT_BROKER_REQUIRED: "1"
     timeout-minutes: 15
     steps:
       - name: Get the code
@@ -29,11 +34,22 @@ jobs:
       - name: Install the packages
         run: pip install -r requirements.txt
 
+      - name: Start the MQTT broker (Mosquitto) for the MQTT tests
+        run: |
+          docker run -d --name mqtt -p 127.0.0.1:1883:1883             -v "$PWD/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro" eclipse-mosquitto:2.0.23
+          for i in $(seq 1 30); do
+            python -c "import socket; socket.create_connection(('127.0.0.1', 1883), timeout=1)" && exit 0
+            sleep 1
+          done
+          echo "MQTT broker did not start"; exit 1
+
       - name: Run the quick tests
         run: python -m pytest -m "not night" -v
 
   night-tests:
     runs-on: ubuntu-latest
+    env:
+      MQTT_BROKER_REQUIRED: "1"
     timeout-minutes: 40
     steps:
       - name: Get the code
@@ -47,6 +63,15 @@ jobs:
 
       - name: Install the packages
         run: pip install -r requirements.txt
+
+      - name: Start the MQTT broker (Mosquitto) for the MQTT tests
+        run: |
+          docker run -d --name mqtt -p 127.0.0.1:1883:1883             -v "$PWD/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro" eclipse-mosquitto:2.0.23
+          for i in $(seq 1 30); do
+            python -c "import socket; socket.create_connection(('127.0.0.1', 1883), timeout=1)" && exit 0
+            sleep 1
+          done
+          echo "MQTT broker did not start"; exit 1
 
       - name: Run the night tests
         run: python -m pytest -m night -v --durations=10

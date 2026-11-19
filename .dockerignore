@@ -13,4 +13,5 @@ __pycache__/
 .git/
 tests/
 grafana/
+mosquitto/
 results/

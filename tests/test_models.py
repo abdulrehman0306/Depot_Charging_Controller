@@ -226,3 +226,13 @@ def test_week_summary_adds_up_the_nights():
 def test_week_table_never_rounds_a_peak_up_to_the_limit():
     table = markdown_table(summarize_week(make_week_nights()))
     assert "| Impossible | Smart | 149.9 kW | 2 | 18 of 20 | 20.0 kWh (15.0) | 800 kWh | 60.00 EUR | 7.50 ct/kWh |" in table
+
+
+def test_a_sample_with_a_guessed_building_load_is_not_counted_as_over_the_limit():
+    # The controller used the 60 kW safe guess for the building: its site power of 170 kW
+    # was not measured, so it must not appear as time over the limit.
+    site_log = make_site_log([130, 170, 170, 130])
+    for minute in (1, 2):
+        site_log[minute]["building_is_guess"] = True
+    assert minutes_over_limit(site_log, 150) == 0.0
+    assert over_limit_episodes(site_log, 150) == []

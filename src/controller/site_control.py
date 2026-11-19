@@ -2,7 +2,8 @@
 The controller's control loop and safety layer.
 
 Once per simulated minute, like a PLC scan cycle:
-1. Read the building load from the meter (Modbus TCP).
+1. Read the building load from the meter (Modbus TCP, or the newest fresh reading
+   over MQTT, see BUILDING_LOAD_SOURCE in settings.py).
 2. Log the measured site power: building + what the chargers report over OCPP.
 3. Decide whether a new plan is needed, and if so, plan and send the limits:
    - every quarter hour (regular plan; equal sharing rotates its queue,
@@ -35,6 +36,7 @@ from ocpp.v201.enums import ChargingStateEnumType
 import settings
 from src.controller.central_system import send_power_limit
 from src.controller.meter_reader import MeterReadError, read_meter, write_meter_clock
+from src.controller.mqtt_meter_reader import MqttMeterReader
 from src.controller.smart_planner import plan_charging, plan_steps, warm_up_solver
 from src.controller.storage import charger_points, price_point, site_point
 from src.controller.strategies import equal_sharing
@@ -115,7 +117,8 @@ class SiteController:
                  site_limit_kw=settings.SITE_LIMIT_KW, safety_margin_kw=settings.SAFETY_MARGIN_KW,
                  scenario_name=None, fleet_schedule=None, prices=None, storage=None, run_name=""):
         """
-        In: dict of all chargers by id, simulated clock, Modbus client for the meter,
+        In: dict of all chargers by id, simulated clock, the meter (a Modbus client, or an
+            MqttMeterReader when the building load comes over MQTT),
             strategy name ("uncontrolled", "equal_sharing" or "smart"), site limit [kW],
             safety margin [kW], scenario name (only for the report), and for the smart
             controller: the fleet schedule (van id -> departure time) and the day-ahead
@@ -149,6 +152,8 @@ class SiteController:
         self.recent_plan_delays = []
 
         self.building_kw = None
+        # True while building_kw is the safe guess, not a reading.
+        self.building_is_guess = False
         self.site_log = []
         self.safety_actions = []
         # Every limit sent: dicts with time, charger_id, limit_kw and limit_a.
@@ -198,7 +203,13 @@ class SiteController:
     async def control_cycle(self):
         """One scan: read the meter, log the site, plan if needed, report at the end of the night."""
         now = self.clock.now()
-        self.building_kw = await read_building_load_kw(self.meter_client, now, self.building_kw)
+        if isinstance(self.meter_client, MqttMeterReader):
+            self.building_kw = await self.meter_client.building_load_kw(now)
+            self.building_is_guess = self.meter_client.using_safe_guess
+        else:
+            # Over Modbus the safe guess is used only when there is no earlier reading.
+            self.building_is_guess = self.building_kw is None
+            self.building_kw = await read_building_load_kw(self.meter_client, now, self.building_kw)
         self.record_sample(now)
         if self.should_store_measurements():
             self.store_measurements(now)
@@ -481,6 +492,8 @@ class SiteController:
             "estimated_site_kw": self.estimated_site_kw(),
             # The limit in force now. It can be changed through the API during the run.
             "site_limit_kw": self.site_limit_kw,
+            # The building load was the safe guess: the site power was not measured.
+            "building_is_guess": self.building_is_guess,
         }
         self.site_log.append(sample)
 
@@ -493,6 +506,8 @@ class SiteController:
                     f"site {sample['site_kw']:6.1f} kW of {self.site_limit_kw:.0f} kW")
             if is_over_limit:
                 line += f" | OVER LIMIT by {sample['site_kw'] - self.site_limit_kw:.1f} kW"
+            if self.building_is_guess:
+                line += " | building load is the safe guess, not a reading"
             self.events.info(line)
             self.last_printed_quarter = quarter
 
@@ -507,7 +522,9 @@ class SiteController:
 
     def log_night_summary(self):
         """Print the peak site power, time over the limit, safety actions and spike reaction times."""
-        peak_kw, peak_time = peak_site_power(self.site_log)
+        # Peak and minutes over the limit only from cycles with a real building reading.
+        measured_log = [sample for sample in self.site_log if not sample["building_is_guess"]] or self.site_log
+        peak_kw, peak_time = peak_site_power(measured_log)
         # The limit may have been changed through the API, so each minute is checked against
         # the limit in force at that moment.
         limits_kw = sorted({sample.get("site_limit_kw", self.site_limit_kw) for sample in self.site_log})
@@ -522,6 +539,13 @@ class SiteController:
         if self.strategy_name == "smart":
             self.events.info("summary: %d smart plans, %d of them used the fallback rule",
                              self.smart_plans, self.fallback_plans)
+        if isinstance(self.meter_client, MqttMeterReader):
+            self.events.info("summary: building load over MQTT: %d cycles with a fresh reading, %d with the safe guess",
+                             self.meter_client.fresh_cycles, self.meter_client.safe_guess_cycles)
+        guessed = sum(1 for sample in self.site_log if sample["building_is_guess"])
+        if guessed:
+            self.events.info("summary: %d cycles had no building reading and used the safe guess; they are not "
+                             "counted in the peak and the minutes over the limit above", guessed)
 
         # The spike times come from the scenario. They are used only here, to measure the reaction.
         if self.scenario_name is not None:

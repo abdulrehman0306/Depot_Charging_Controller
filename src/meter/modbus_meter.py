@@ -11,13 +11,18 @@ controller writes the simulated time into registers 20-21 on every read,
 and the meter follows it. Real meters have similar clock registers that a
 SCADA system writes to keep the meter's clock right.
 
+MQTT: the meter also publishes every reading to the MQTT broker (see
+src/meter/mqtt_publisher.py). When the controller reads over MQTT, it sends its
+clock over MQTT too, and the meter follows that.
+
 Run it (before the controller):
     python -m src.meter.modbus_meter
 """
 
 import asyncio
 import logging
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 
 from pymodbus.server import ModbusTcpServer
 from pymodbus.simulator import DataType, SimData, SimDevice
@@ -25,6 +30,7 @@ from pymodbus.simulator import DataType, SimData, SimDevice
 import settings
 from src.log_setup import setup_logging
 from src.meter.building_load import building_load_kw
+from src.meter.mqtt_publisher import MeterMqttPublisher
 from src.scenarios import get_scenario
 from src.meter.registers import (
     CLOCK_SYNC_UNIX_S,
@@ -63,8 +69,14 @@ class SimulatedMeter:
     A class is used because the meter has to remember its energy counter and clock between updates.
     """
 
-    def __init__(self, server, clock, load_spikes=()):
+    def __init__(self, server, clock, load_spikes=(), mqtt_publisher=None):
+        """
+        In: the running Modbus server, the meter's clock, the scenario's load spikes,
+            and optionally a MeterMqttPublisher to publish every reading over MQTT.
+        """
         self.server = server
+        self.mqtt_publisher = mqtt_publisher
+        self.last_mqtt_clock_unix_s = None
         self.clock = clock
         # Extra loads of the scenario (synthetic), e.g. the 40 kW workshop spike.
         self.load_spikes = load_spikes
@@ -83,6 +95,20 @@ class SimulatedMeter:
             sync_time = datetime.fromtimestamp(unix_s, tz=settings.TIMEZONE)
             self.clock.set_time(sync_time)
             self.last_clock_sync_unix_s = unix_s
+
+        # The same over MQTT, if the controller sends its clock there. Only a large
+        # difference moves the clock (see MQTT_CLOCK_TOLERANCE_MINUTES in settings.py).
+        if self.mqtt_publisher is not None and self.mqtt_publisher.newest_clock is not None:
+            mqtt_unix_s, received_at = self.mqtt_publisher.newest_clock
+            if mqtt_unix_s != self.last_mqtt_clock_unix_s:
+                self.last_mqtt_clock_unix_s = mqtt_unix_s
+                # The message may have waited up to one update interval for this moment:
+                # add the simulated time that has passed since it arrived.
+                waited_s = (time.monotonic() - received_at) * self.clock.simulation_speed
+                controller_time = (datetime.fromtimestamp(mqtt_unix_s, tz=settings.TIMEZONE)
+                                   + timedelta(seconds=waited_s))
+                if abs(self.clock.now() - controller_time) > timedelta(minutes=settings.MQTT_CLOCK_TOLERANCE_MINUTES):
+                    self.clock.set_time(controller_time)
 
     async def update_registers(self):
         """One measuring step: count energy, take the new building power, write the register table."""
@@ -103,6 +129,8 @@ class SimulatedMeter:
         registers = build_meter_registers(self.building_power_kw, self.energy_import_kwh,
                                           settings.PHASE_VOLTAGE_V, GRID_FREQUENCY_HZ)
         await self.server.async_setValues(settings.METER_DEVICE_ID, HOLDING_REGISTERS, 0, registers)
+        if self.mqtt_publisher is not None:
+            self.mqtt_publisher.publish_reading(now, self.building_power_kw)
 
     async def run(self):
         """Update the registers once per simulated minute, forever."""
@@ -119,7 +147,16 @@ async def run_meter():
     server, port = await start_meter_server(settings.METER_HOST, settings.METER_PORT)
     logging.getLogger("METER").info("Modbus TCP meter listening on %s:%s, unit id %s, scenario %s",
                                     settings.METER_HOST, port, settings.METER_DEVICE_ID, scenario["name"])
-    await SimulatedMeter(server, clock, scenario["load_spikes"]).run()
+    # Publish over MQTT as well. Without a broker the meter works on over Modbus alone,
+    # and the publisher keeps trying to connect in the background.
+    publisher = MeterMqttPublisher(settings.MQTT_HOST, settings.MQTT_PORT)
+    publisher.start()
+    logging.getLogger("METER").info("publishing readings to MQTT topic %s on %s:%s", publisher.power_topic,
+                                    settings.MQTT_HOST, settings.MQTT_PORT)
+    try:
+        await SimulatedMeter(server, clock, scenario["load_spikes"], publisher).run()
+    finally:
+        publisher.stop()
 
 
 def main():
