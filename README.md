@@ -8,6 +8,16 @@ Software that charges a fleet of electric delivery vans overnight: every van rea
 
 *One night of the smart controller in the Docker setup (14 to 15 January 2026, real day-ahead prices). The vans wait through the expensive evening and charge after midnight, up to the 135 kW planning target, never over the 150 kW limit.*
 
+## Results at a glance
+
+From 147 simulated nights: 7 scenarios, 3 strategies, 7 nights each, with real German day-ahead prices.
+
+- **Uncontrolled charging peaked at 242 kW on a 150 kW connection** and was over the limit for 569 to 1,475 minutes per week. Both controlled strategies kept the limit in every scenario except an unannounced 40 kW load spike.
+- **The smart controller paid 29 % less per kWh than equal sharing** on a normal January week (8.89 against 12.58 ct/kWh), and every van still left with at least 90 %.
+- **On the week with negative night prices it paid 60 % less** than equal sharing (4.87 against 12.30 ct/kWh).
+- **When there is not enough energy for every van, 55 of 70 vans still reached 90 %** with the smart controller, against 0 of 70 with equal sharing, and every van that would be short was announced hours before departure.
+- **After the 40 kW load spike the site was back under the limit in about 2 minutes** (2.06 to 2.08 minutes on all 7 nights, measured at a realistic 300 times real time), set by the meter being read once a minute.
+
 ## 1. What it does
 
 A central controller (a CSMS, "charging station management system") talks to ten simulated 22 kW chargers over **OCPP 2.0.1** and reads a simulated building energy meter over **Modbus TCP**, or, chosen by a setting, over **MQTT** from a Mosquitto broker that the meter publishes its readings to, like an IoT energy meter. Once per simulated minute it decides how much current every charger may give, and sends it as a charging profile. It can do that in three ways (uncontrolled, equal sharing, and a smart controller that optimises against real German day-ahead prices), so they can be compared on the same nights.
@@ -75,17 +85,11 @@ Topic names are levels split by `/`, and a subscriber can use wildcards: `depot/
 docker compose exec mqtt mosquitto_sub -t "depot/#" -v
 ```
 
-**QoS (quality of service)** is how hard the broker and the clients try to deliver a message:
-
-- **QoS 0, "at most once"**: send it and forget it. Fast, but a message can be lost.
-- **QoS 1, "at least once"**: the receiver confirms each message, and the sender repeats it until the confirmation comes. Nothing is lost, but a message can arrive twice.
-- **QoS 2, "exactly once"**: a four-step handshake makes sure it arrives exactly once. The slowest.
-
-This project uses **QoS 1** for both topics. A reading that arrives twice does no harm (same time stamp, same value), and losing readings is what QoS 1 prevents. QoS 2's extra handshake buys nothing here.
+Both topics use **QoS 1** ("at least once"): every message is confirmed and sent again until it is, so no reading is lost, and the occasional duplicate does no harm because it carries the same time stamp and value.
 
 **A lost connection is handled on the safe side.** With polling, a failed request tells the controller at once that something is wrong. With publish/subscribe, a broken broker, network or meter just means that *no more messages come*, and silence looks the same as "nothing changed". So every reading carries the meter's time stamp, and the controller only uses a reading that is at most **2.5 simulated minutes** old: one missed reading (1 minute), plus up to 1 minute because the controller reads at any point between two readings, plus half a minute for network delay and the meter's clock being a few seconds behind. Without a fresh reading it uses the **same safe high guess (60 kW)** as for a meter it cannot read over Modbus, which leaves less room for charging, never more. Both MQTT clients reconnect by themselves (after 1 s, then up to every 5 s) and subscribe again after each reconnect. Cycles that used the guess are marked in the controller's log and in InfluxDB (`building_is_guess`), and are not counted as measured time over the limit.
 
-**Checked live in Docker**, from a fresh clone with empty volumes (load spike night, equal sharing, building load over MQTT, simulation speed 600): the 40 kW spike at 19:30 was caught over MQTT, and the site was back under the limit after 1.5 minutes. Then the broker was stopped for 10 real seconds (`docker compose stop mqtt`, then `start`). The controller's newest reading was from 23:41:45; at 23:44:48, the first cycle after the reading was more than 2.5 minutes old, it switched to the 60 kW safe guess. Both clients reconnected by themselves when the broker was back, and from 01:59:04 the readings were fresh again. Over the night: 816 cycles with a fresh reading, 134 with the safe guess (InfluxDB holds the same 134 of 950 site samples marked `building_is_guess`), 1 measured minute over the limit (the spike), and all ten vans left with 100.0 % (equal sharing fills every van).
+**Checked live in Docker**: over MQTT the 40 kW load spike was caught and the site was back under the limit in 1.5 minutes. When the broker was stopped for 10 seconds, the controller switched to the safe guess once its newest reading was more than 2.5 minutes old, went back to fresh readings by itself after reconnecting, and every van was still fully charged.
 
 **Under test** (`tests/test_mqtt.py`), against a real Mosquitto: a reading travels from the meter to the controller; an old reading, no reading and no broker all give the safe guess; a connection cut in the middle (a small relay between controller and broker is cut and restored) gives the safe guess until the client has reconnected by itself, and then fresh readings again; the meter follows the controller's clock over MQTT; and a whole load spike night over MQTT keeps the limit like Modbus, with a fresh reading in at least 97 % of the cycles.
 
@@ -124,9 +128,9 @@ $env:SIM_SPEED="600"; $env:SCENARIO="load_spike"; $env:STRATEGY="equal_sharing";
 
 (or set them in `.env`). To read the building load over MQTT instead of Modbus, add `$env:BUILDING_LOAD_SOURCE="mqtt"`. Scenarios: `normal_evening`, `rush`, `late_van`, `charger_failure`, `load_spike`, `negative_prices`, `impossible`. Strategies: `uncontrolled`, `equal_sharing`, `smart`. `docker compose down` stops everything; the data stays in the volumes.
 
-Checked on a fresh run for this README: a smart night of the normal scenario at 600 times real time. The chargers container finished with exit code 0, all ten vans left with 92.1 to 95.8 %, the controller reported a peak of 135.0 kW at 01:47, 0 minutes over the limit, 0 safety actions, and 54 plans with none needing the fallback rule. The image is 706 MB; `.env` is kept out of it by `.dockerignore`, and the secrets reach the containers as environment variables.
+`.env` is kept out of the image by `.dockerignore`; the secrets reach the containers as environment variables. In a smart night of the normal scenario in Docker, all ten vans left with 92.1 to 95.8 %, the site peaked at 135.0 kW, and no plan needed the fallback rule.
 
-Clean-start check: a fresh clone of the repository, a new `.env` made from `.env.example` with new random values, a new virtual environment from `requirements.txt`, and the clone's own Mosquitto. All 147 tests passed, none skipped (11 minutes 28 seconds, including complete nights of every scenario with every strategy, and one over MQTT). Then `docker compose up` from the same clone with empty volumes, with the building load over MQTT: the night ran as described under "MQTT" above, and Grafana reported "datasource is working" and loaded the dashboard with its 5 panels. The image is 707 MB.
+A clean start from a fresh clone, with a new `.env` and a new virtual environment, passed all 147 tests and then ran a full night in Docker with the dashboard loaded.
 
 ### The dashboard
 
@@ -148,7 +152,7 @@ python -m src.dashboard_screenshot
 | `GET /vans` | every plugged-in van: charger, state of charge, departure time, the smart controller's forecast shortfall |
 | `PUT /site-limit` | change the grid limit, e.g. `{"site_limit_kw": 120}`, between 20 and 400 kW |
 
-A new limit is used from the next control cycle. In a live run (equal sharing, simulation speed 600) the limit was lowered from 150 to 100 kW at 19:36 while the site drew 134.6 kW; the next cycle cut charging, at 19:38:41 the site was back under 100 kW, and at 19:45 it drew 84.8 kW, just under the new 85 kW target. A request for 5 kW is refused with HTTP 422.
+A new limit is used from the next control cycle: in a live run, lowering it from 150 to 100 kW while the site drew 134.6 kW brought the site back under 100 kW within three simulated minutes. A limit outside 20 to 400 kW is refused with HTTP 422.
 
 ### Without Docker, for development
 
@@ -170,7 +174,7 @@ python -m src.chargers.run_chargers
 ### The results and the tests
 
 ```
-python -m src.run_week                 every scenario x strategy x 7 nights -> results/nights.csv (84 minutes here)
+python -m src.run_week                 every scenario x strategy x 7 nights -> results/nights.csv
 python -m src.results                  tables and charts from results/nights.csv
 python -m src.measure_spike_reaction   the load spike reaction at a slow speed -> results/spike_reaction.csv
 python -m pytest -m "not night"        quick tests
@@ -234,7 +238,7 @@ Every scenario was run with every strategy on **7 nights in a row: 147 complete 
 
 ### The week in one table
 
-Each line is 7 nights, 70 van visits. Peak site power is the highest true value of the week (rounded down, so 149.99 shows as 149.9). Energy cost is the day-ahead price only; grid fees, taxes and levies are the same for every strategy and are left out.
+Each line is 7 nights, 70 van visits. Peak site power is the highest true value of the week (rounded down, so 149.99 shows as 149.9). Energy cost is the day-ahead price only; grid fees, taxes and levies are the same for every strategy and are left out. The 17 minutes over the limit for the load spike with equal sharing are distorted by the 3000x simulation speed; at a realistic speed it is 2 minutes per spike (see "Reaction to the 40 kW load spike").
 
 | Scenario | Strategy | Peak site power | Minutes over 150 kW | Vans at 90 % | Shortfall (largest van) | Energy | Cost | Average price |
 |---|---|---|---|---|---|---|---|---|
@@ -265,7 +269,7 @@ Each line is 7 nights, 70 van visits. Peak site power is the highest true value 
 - **Uncontrolled charging breaks the limit every night.** The site reached 189 to 242 kW, and was over 150 kW for 569 to 1,475 minutes per week, depending on the scenario.
 - **Both controlled strategies kept the limit in every scenario**, with one exception: the load spike with equal sharing (see below). Every van reached 90 % in all six possible scenarios with every strategy.
 - **The smart controller paid 29 % less per kWh than equal sharing and 32 % less than uncontrolled** on the normal week (8.89 against 12.58 and 12.98 ct/kWh). On the week with negative night prices it paid 4.87 ct/kWh, 60 % less than equal sharing. Over the normal week it cost 314.30 EUR against 505.35 EUR uncontrolled; part of that difference is less energy, because uncontrolled charging and equal sharing fill every van to 100 %, while the smart controller stops at about 92 %. The average price per kWh is the fair comparison.
-- **The smart peaks of 149.9 kW are the safety margin doing its job.** The smart controller charges at the full 135 kW target in cheap hours, also at 05:00, when the building profile steps up by 15 kW. In a re-run of the night of 18 to 19 January the true site went from 134.85 to 149.85 kW at 05:00 for two minutes, until the next plan took the step into account (134.88 kW at 05:02). Equal sharing charges at full power only in the evening, when the building load is steady, so it stays at 135 kW.
+- **The smart peaks of 149.9 kW are the safety margin doing its job.** The smart controller charges at the full 135 kW target in cheap hours, including when the building load steps up by 15 kW in the early morning, and the 15 kW margin absorbs that step until the next plan accounts for it. Equal sharing charges at full power only in the evening, when the building load is steady, so it stays at 135 kW.
 - **When the energy is simply not there** (impossible scenario), the strategies differ in who pays for it. Equal sharing spreads the shortage: none of the 70 vans reached 90 %, each was about 11 kWh short (at most 11.3 kWh). The smart controller serves vans in priority order: 55 of 70 reached 90 %, and 15 were short by up to 63.8 kWh, each one announced hours before departure. Its total shortfall is higher (878.5 against 781.0 kWh) because the vans it finished got their 2 % reserve above 90 %, energy that does not count against the shortfall. Uncontrolled charging filled all vans, at 242 kW on a 150 kW connection.
 - **The smart controller made 3,378 plans in the week; none needed the fallback rule.**
 
@@ -297,12 +301,13 @@ The week table shows 17 minutes over the limit for this case (2 to 4 minutes in 
 
 With the smart controller the spike never took the site over the limit: at 19:30 prices are high, so few or no vans were charging and the extra 40 kW fitted under 150 kW.
 
-### Things the live runs found that the tests had not
+### What live testing revealed
 
-- **A simulation that is too fast distorts timing**: the load spike above. That is also why the smart controller is tested at 1000 and not 3000 times real time: one plan takes the optimiser about 80 real milliseconds, which would be 4 simulated minutes at 3000x.
-- **Start-up work counts**: in the first Docker run the dashboard showed no data before 16:24 although the night starts at 15:30. Reading the price files and the solver's first solve had taken real seconds while the simulated clock was already running. Now they run before the clock starts.
-- **The first meter reading can be stale**: the meter follows the controller's clock only at its next update, so the very first reading showed the load for the meter's own clock. The controller now uses a safe high guess (60 kW) for that one first minute.
-- **Storage must never block control**: each InfluxDB write is a background task. A whole night with InfluxDB switched off had 841 failed writes and otherwise ran normally.
+- **A simulation that runs too fast distorts timing.** At 3000 times real time the load spike reaction looked like 3 to 6 minutes instead of 2, and one 80 ms optimiser run would take 4 simulated minutes, so smart nights run at 1000x.
+- **Start-up work counts.** The first Docker run lost the first 54 minutes of the night, because the price files and the first solve were loaded while the simulated clock was already running; they now run before it starts.
+- **The first meter reading can be stale.** The meter follows the controller's clock only at its next update, so the controller uses the 60 kW safe guess for the very first minute.
+- **Storage must never block control.** Every InfluxDB write runs in the background; a whole night with InfluxDB switched off ran normally, with 841 failed writes.
+- **A guess is not a measurement.** With the MQTT broker stopped, the controller's report first counted the 60 kW safe guess as a measured peak of 172.5 kW; guessed cycles are now marked and left out of the measured results.
 
 ## 7. Limitations
 
