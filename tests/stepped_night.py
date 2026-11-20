@@ -17,15 +17,12 @@ from datetime import timedelta
 from types import SimpleNamespace
 
 import settings
-from src.chargers.van import charge_van
+from src.chargers.van import charge_van, is_full
 from src.controller.run_controller import fleet_schedule_from_vans
 from src.controller.site_control import SiteController
 from src.electrical import charging_current_limit_a, current_a_to_power_kw
 from src.meter.building_load import building_load_kw
 from src.scenarios import get_scenario
-
-FULL_STATE_OF_CHARGE_PERCENT = 99.999
-
 
 class SteppedClock:
     """A simulated clock that only moves when the test moves it. No real time is involved."""
@@ -78,7 +75,7 @@ async def run_stepped_smart_night(scenario_name, prices, plan_delays_minutes):
         # The controller: plan at every new quarter hour, and when the vans change.
         controller.building_kw = building_load_kw(now, scenario["load_spikes"])
         wanting_ids = sorted(charger_id for charger_id, charger in chargers.items()
-                             if charger.state_of_charge_percent < FULL_STATE_OF_CHARGE_PERCENT)
+                             if not is_full(charger.state_of_charge_percent))
         quarter = (now.date(), now.hour, now.minute // 15)
         if quarter != last_quarter or set(wanting_ids) != planned_ids:
             new_limits = await controller.smart_limits(now, wanting_ids, 0.0, regular=(quarter != last_quarter))

@@ -10,7 +10,7 @@ import pandas as pd
 import pytest
 
 import settings
-from src.chargers.van import Van, charge_van, grid_energy_to_reach_kwh
+from src.chargers.van import Van, charge_van, grid_energy_to_reach_kwh, is_full
 from src.electrical import charging_current_limit_a, current_a_to_power_kw, power_kw_to_current_a
 from src.meter.building_load import LoadSpike, building_load_kw
 from src.results import (
@@ -236,3 +236,30 @@ def test_a_sample_with_a_guessed_building_load_is_not_counted_as_over_the_limit(
         site_log[minute]["building_is_guess"] = True
     assert minutes_over_limit(site_log, 150) == 0.0
     assert over_limit_episodes(site_log, 150) == []
+
+
+# ---------------------------------------------------------------------------
+# When a battery counts as full
+# ---------------------------------------------------------------------------
+
+def test_a_van_just_below_full_is_not_full_and_its_next_step_fills_it():
+    # 99.99924 % is where a van stopped in a GitHub Actions run: a charging step happened to
+    # end just below 100 %, and the old 99.999 % rule called it full, about 0.6 Wh short.
+    state_of_charge_percent = 99.99924
+    assert not is_full(state_of_charge_percent)
+    new_state_of_charge_percent, grid_energy_kwh = charge_van(state_of_charge_percent, 22.0, 1 / 60)
+    assert new_state_of_charge_percent == pytest.approx(100.0, abs=1e-9)
+    assert is_full(new_state_of_charge_percent)
+    assert grid_energy_kwh == pytest.approx(grid_energy_to_reach_kwh(state_of_charge_percent, 100.0))
+
+
+@pytest.mark.parametrize("step_seconds", [1, 7, 13.3, 60, 61.7])
+def test_charging_in_many_uneven_steps_ends_exactly_full(step_seconds):
+    # Many floating point additions must still end at a state that counts as full,
+    # and the energy drawn must match the energy needed, whatever the step length.
+    state_of_charge_percent, total_grid_kwh = 20.8, 0.0
+    while not is_full(state_of_charge_percent):
+        state_of_charge_percent, grid_energy_kwh = charge_van(state_of_charge_percent, 22.0, step_seconds / 3600)
+        total_grid_kwh += grid_energy_kwh
+    assert state_of_charge_percent == pytest.approx(100.0, abs=1e-9)
+    assert total_grid_kwh == pytest.approx(grid_energy_to_reach_kwh(20.8, 100.0))

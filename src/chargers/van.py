@@ -21,6 +21,19 @@ class Van:
     arrival_state_of_charge_percent: float
 
 
+# A battery counts as full from this state of charge. It is not exactly 100 only because
+# adding up many charging steps in floating point can end a hair below 100 (around 1e-12 %).
+# Anything further from 100 is a battery that is not full yet and keeps charging: with a
+# wider margin (it was 99.999 %) a step that happened to end at, say, 99.9992 % made the
+# van stop as "full" while still about 0.6 Wh short.
+FULL_STATE_OF_CHARGE_PERCENT = 100.0 - 1e-9
+
+
+def is_full(state_of_charge_percent):
+    """In: state of charge [%]. Out: True if the battery is full and takes no more energy."""
+    return state_of_charge_percent >= FULL_STATE_OF_CHARGE_PERCENT
+
+
 def grid_energy_to_reach_kwh(state_of_charge_percent, target_state_of_charge_percent,
                              battery_kwh=settings.VAN_BATTERY_USABLE_KWH,
                              charging_efficiency=settings.CHARGING_EFFICIENCY):

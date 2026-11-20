@@ -40,16 +40,13 @@ from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
 
 import settings
-from src.chargers.van import charge_van
+from src.chargers.van import charge_van, is_full
 from src.electrical import current_a_to_power_kw
 from src.sim_clock import SimulationClock
 
 EVSE_ID = 1
 CONNECTOR_ID = 1
 
-# Above this state of charge the van counts as full and stops taking power.
-# Not exactly 100 because of small rounding errors in floating point maths.
-FULL_STATE_OF_CHARGE_PERCENT = 99.999
 
 
 def build_meter_value(timestamp, charge_power_kw, energy_meter_wh, context, state_of_charge_percent=None):
@@ -262,7 +259,7 @@ class SimulatedCharger(ChargePoint):
             return ChargingStateEnumType.idle
         if self.charge_power_kw > 0:
             return ChargingStateEnumType.charging
-        if self.state_of_charge_percent >= FULL_STATE_OF_CHARGE_PERCENT:
+        if is_full(self.state_of_charge_percent):
             return ChargingStateEnumType.suspended_ev
         if self.last_energy_update_time is None:
             return ChargingStateEnumType.ev_connected
@@ -374,7 +371,7 @@ class SimulatedCharger(ChargePoint):
         The power is the controller's limit, but never more than the charger
         hardware can deliver, and zero once the battery is full.
         """
-        if self.state_of_charge_percent >= FULL_STATE_OF_CHARGE_PERCENT:
+        if is_full(self.state_of_charge_percent):
             new_power_kw = 0.0
         else:
             new_power_kw = min(self.power_limit_kw, self.max_power_kw)
@@ -387,7 +384,7 @@ class SimulatedCharger(ChargePoint):
         else:
             trigger_reason = TriggerReasonEnumType.charging_rate_changed
 
-        if new_power_kw == 0 and self.state_of_charge_percent >= FULL_STATE_OF_CHARGE_PERCENT:
+        if new_power_kw == 0 and is_full(self.state_of_charge_percent):
             self.events.info("%s van %s full", self.clock.now().strftime("%H:%M"), self.van.van_id)
         self.charge_power_kw = new_power_kw
         await self.send_transaction_event(
